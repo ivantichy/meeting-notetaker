@@ -23,6 +23,7 @@ from app.models import RecorderState
 from app.scheduler import pick_action
 from app.ui.call_panel import CallPanel
 from app.ui.meeting_list import MeetingListWidget
+from app.ui.onboarding import IcsSetupDialog
 
 log = logging.getLogger(__name__)
 
@@ -150,9 +151,12 @@ class MainWindow(QMainWindow):
         tray_menu = QMenu(self)
         show_action = QAction("Zobrazit", self)
         show_action.triggered.connect(self._restore_window)
+        settings_action = QAction("Nastavení…", self)
+        settings_action.triggered.connect(self._open_settings)
         quit_action = QAction("Ukončit", self)
         quit_action.triggered.connect(self._quit)
         tray_menu.addAction(show_action)
+        tray_menu.addAction(settings_action)
         tray_menu.addSeparator()
         tray_menu.addAction(quit_action)
         self._tray.setContextMenu(tray_menu)
@@ -453,6 +457,29 @@ class MainWindow(QMainWindow):
 
     def _on_meeting_selected(self, meeting) -> None:  # pro budoucí použití
         log.debug("Vybrána schůzka: %s", getattr(meeting, "title", meeting))
+
+    # --------------------------------------------------------------- nastavení
+
+    def _open_settings(self) -> None:
+        """Otevře dialog pro změnu tajné ICS adresy a po uložení obnoví kalendář."""
+        from app.config import save_config
+
+        url = IcsSetupDialog.get_url(self, initial=self._cfg.ics_url or "")
+        if not url or url == self._cfg.ics_url:
+            return  # zrušeno nebo beze změny
+        self._cfg.ics_url = url
+        try:
+            save_config(self._cfg, "config.json")
+        except Exception:  # noqa: BLE001
+            log.exception("Uložení konfigurace selhalo")
+            QMessageBox.warning(
+                self,
+                "Nastavení kalendáře",
+                "Adresu se nepodařilo uložit do config.json.",
+            )
+            return
+        # CalendarService čte cfg.ics_url přímo, takže stačí obnovit kalendář.
+        self.refresh_calendar()
 
     # ------------------------------------------------------------------ tray
 

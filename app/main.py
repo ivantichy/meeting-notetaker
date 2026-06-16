@@ -26,17 +26,37 @@ def main() -> int:
     log = logging.getLogger(__name__)
     log.info("Spouštím Meeting Notetaker (kořen: %s)", root)
 
-    from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit
+    import tempfile
+
+    from PySide6.QtCore import QLockFile
+    from PySide6.QtWidgets import QApplication, QMessageBox
 
     from app.calendar_ics import CalendarService
     from app.config import load_config, save_config
     from app.recorder import Recorder
     from app.storage import NoteStore
     from app.ui.main_window import MainWindow
+    from app.ui.onboarding import IcsSetupDialog
 
     app = QApplication(sys.argv)
     app.setApplicationName("Meeting Notetaker")
     app.setQuitOnLastWindowClosed(False)  # okno se zavírá do oznamovací oblasti
+
+    # --- jediná instance ----------------------------------------------------
+    # Zámek v systémovém temp adresáři brání spuštění druhé instance (a tím
+    # dvojímu nahrávání téhož hovoru). Referenci držíme po dobu života procesu.
+    lock_path = os.path.join(tempfile.gettempdir(), "meeting-notetaker.lock")
+    lock_file = QLockFile(lock_path)
+    lock_file.setStaleLockTime(0)  # zámek po pádu uvolní OS automaticky
+    if not lock_file.tryLock(100):
+        log.warning("Druhá instance — aplikace už běží, končím.")
+        QMessageBox.information(
+            None,
+            "Meeting Notetaker",
+            "Meeting Notetaker už běží.",
+        )
+        return 0
+    app._single_instance_lock = lock_file  # udržet referenci po dobu běhu
 
     from app.ui.theme import apply_theme
 
@@ -45,17 +65,11 @@ def main() -> int:
     cfg = load_config("config.json")
 
     if not cfg.ics_url:
-        url, ok = QInputDialog.getText(
-            None,
-            "Tajná ICS adresa Google Kalendáře",
-            "Vložte tajnou ICS adresu svého Google Kalendáře.\n\n"
-            "Najdete ji v Google Kalendáři: Nastavení → Nastavení mého kalendáře\n"
-            "→ Integrovat kalendář → „Tajná adresa ve formátu iCal“.",
-            QLineEdit.EchoMode.Normal,
-            "",
-        )
-        if ok and url.strip():
-            cfg.ics_url = url.strip()
+        url = IcsSetupDialog.get_url(None, initial="")
+        if url:
+            cfg.ics_url = url
+        # Uložíme i při zrušení (zachová dosavadní chování: aplikace se
+        # spustí s prázdným kalendářem a adresu lze doplnit přes „Nastavení…“).
         save_config(cfg, "config.json")
 
     note_store = NoteStore(cfg.notes_dir)

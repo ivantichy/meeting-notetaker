@@ -1,12 +1,14 @@
 # Meeting Notetaker — Architecture
 
-Bot-free meeting notetaker for Windows. Granola-style: captures system audio locally
-(WASAPI loopback + mic), transcribes Czech locally via faster-whisper, saves Markdown
-notes to disk (readable by Claude via mounted folder). Google Calendar via secret ICS URL.
+A bot-free meeting notetaker for Windows. It captures system audio locally
+(WASAPI loopback + microphone), transcribes Czech speech locally with
+faster-whisper, and saves Markdown notes to disk. Meetings are read from
+Google Calendar via a secret iCal (ICS) URL.
 
-Target machine: Dell Latitude 7450, Core Ultra 7 165U (CPU-only), 32 GB RAM, Python 3.14, Windows 11.
+Reference target machine: Dell Latitude 7450, Core Ultra 7 165U (CPU only),
+32 GB RAM, Python 3.14, Windows 11.
 
-## Repo layout
+## Repository layout
 
 ```
 meeting-notetaker/
@@ -16,31 +18,38 @@ meeting-notetaker/
     models.py          # Meeting dataclass, RecorderState enum
     calendar_ics.py    # ICS fetch + parse -> list[Meeting]
     scheduler.py       # decides when to auto start/stop recording
-    storage.py         # markdown note files + transcript appending
-    audio_capture.py   # WASAPI loopback + mic capture (lib: soundcard)
+    storage.py         # Markdown note files + transcript appending
+    audio_capture.py   # WASAPI loopback + mic capture (via the `soundcard` lib)
     transcriber.py     # faster-whisper wrapper, chunk queue -> segments
-    recorder.py        # orchestrates capture -> transcribe -> storage, state machine
+    recorder.py        # orchestrates capture -> transcribe -> storage; state machine
+    call_detector.py   # detects an active call from microphone usage (registry)
+    post_processor.py  # re-transcribes the recording with a higher-quality model
+    event_log.py       # human-readable call journal (notes/hovory.log)
     ui/
       __init__.py
       main_window.py   # PySide6 main window + tray
       meeting_list.py  # left panel: today + upcoming meetings
       call_panel.py    # right panel: current call status + live transcript
-    main.py            # entrypoint: wiring, QApplication
+      theme.py         # shared light/dark theme (follows Windows, indigo accent)
+    main.py            # entry point: wiring, QApplication
   tests/
-    conftest.py        # mocks soundcard & faster_whisper via sys.modules
+    conftest.py        # mocks `soundcard` & `faster_whisper` via sys.modules
     test_calendar.py
     test_scheduler.py
     test_storage.py
     test_recorder.py
-  notes/               # output .md files (gitignored content)
-  models/              # whisper model cache (gitignored)
-  config.json          # created on first run
+    test_call_detector.py
+    test_post_processor.py
+  docs/                # screenshots used by the README
+  notes/               # output .md files (content is gitignored)
+  models/              # Whisper model cache (gitignored)
+  config.json          # created on first run (holds the secret ICS URL; gitignored)
   requirements.txt
   run.bat              # venv python -m app.main
   README.md
 ```
 
-## Contracts (exact signatures — all modules code against these)
+## Contracts (exact signatures — every module is written against these)
 
 ### models.py
 
@@ -56,7 +65,7 @@ class Platform(str, Enum):
 
 class RecorderState(str, Enum):
     IDLE = "idle"
-    ARMED = "armed"          # meeting starts within arm_window
+    ARMED = "armed"          # a meeting starts within arm_window
     RECORDING = "recording"
     FINALIZING = "finalizing"
 
@@ -70,7 +79,7 @@ class Meeting:
     join_url: str | None = None
     attendees: list[str] = field(default_factory=list)
     @property
-    def slug(self) -> str: ...   # "2026-06-12_1330_nazev-meetingu" (ascii, max 60)
+    def slug(self) -> str: ...   # "2026-06-12_1330_meeting-title" (ascii, max 60)
 ```
 
 ### config.py
@@ -80,14 +89,18 @@ class Meeting:
 class AppConfig:
     ics_url: str = ""
     language: str = "cs"
-    live_model: str = "small"        # faster-whisper model name
-    post_model: str = ""             # optional re-transcribe after meeting ("" = off)
-    notes_dir: str = "notes"         # relative to app root or absolute
-    poll_minutes: int = 5            # ICS refresh
-    arm_window_s: int = 120          # arm N seconds before start
-    stop_grace_s: int = 300          # keep recording N seconds past scheduled end
-    chunk_seconds: int = 20          # audio chunk for live transcription
+    live_model: str = "small"            # faster-whisper model for the live transcript
+    post_model: str = "large-v3-turbo"   # re-transcribe after the meeting ("" = off)
+    notes_dir: str = "notes"             # relative to app root, or absolute
+    poll_minutes: int = 5                # ICS refresh interval
+    arm_window_s: int = 120              # arm N seconds before start
+    stop_grace_s: int = 300              # keep recording N seconds past scheduled end
+    chunk_seconds: int = 20              # audio chunk for live transcription
     sample_rate: int = 16000
+    detect_calls: bool = True            # auto-detect a call from microphone usage
+    detect_stop_grace_s: int = 20        # stop a detected recording N s after the mic is released
+    early_stop_grace_s: int = 60         # stop a calendar recording N s after the call ends
+    no_call_timeout_s: int = 180         # stop a calendar recording if no call ever starts
 
 def load_config(path: str) -> AppConfig: ...
 def save_config(cfg: AppConfig, path: str) -> None: ...
@@ -102,9 +115,9 @@ def parse_meetings(ics_text: str, window_days: int = 7) -> list[Meeting]:
     Detect platform/join_url from LOCATION, DESCRIPTION, X-GOOGLE-CONFERENCE:
       meet.google.com/* -> MEET ; teams.microsoft.com/l/meetup-join or teams.live.com -> TEAMS.
     Sort by start."""
-class CalendarService:  # QObject-free, pure python; UI polls it
+class CalendarService:  # QObject-free, pure Python; the UI polls it
     def __init__(self, cfg: AppConfig): ...
-    def refresh(self) -> list[Meeting]: ...     # fetch+parse, keeps last good result on network error
+    def refresh(self) -> list[Meeting]: ...     # fetch+parse; keeps the last good result on a network error
     @property
     def meetings(self) -> list[Meeting]: ...
     @property
@@ -123,49 +136,79 @@ def pick_action(now: datetime, meetings: list[Meeting], state: RecorderState,
     Overlapping meetings: earliest start wins; never auto-stop early for the next one."""
 ```
 
+### call_detector.py  (Windows-only; `winreg` imported lazily so it loads on Linux)
+
+```python
+def detect_label(entries: list[tuple[str, int]]) -> str | None:
+    """Pure logic (testable). From (identifier, last_stop) pairs, return a label
+    for the active call, or None. `last_stop == 0` means the app is using the mic
+    right now. Watched apps: Teams (packaged + unpackaged), Chrome/Edge/Firefox
+    (assumed Google Meet). Teams takes priority over a browser."""
+def active_call() -> str | None:
+    """Read the microphone ConsentStore from the registry and return a call label
+    (e.g. "Teams hovor"), or None. Never raises — detection must not crash the app."""
+```
+
+Windows records in the registry (CapabilityAccessManager / ConsentStore) which
+applications are currently using the microphone. An entry with
+`LastUsedTimeStop == 0` means "using the microphone right now". We watch the apps
+that host calls and treat a held microphone as an active call.
+
 ### storage.py
 
 ```python
 class NoteStore:
     def __init__(self, notes_dir: str): ...
     def create_note(self, meeting: Meeting) -> str:
-        """Create notes/<slug>.md with YAML frontmatter (title,start,end,platform,
-        attendees,join_url,status: recording) + '## Přepis' heading. Returns path.
-        If file exists (restart), append a '--- pokračování ---' marker instead."""
+        """Create notes/<slug>.md with YAML frontmatter (title, start, end, platform,
+        attendees, join_url, status: recording) and a '## Přepis' heading. Returns the path.
+        If the file already exists (restart), append a '--- pokračování ---' marker instead."""
     def append_segment(self, path: str, t0: float, t1: float, text: str) -> None:
-        """Append '[HH:MM:SS] text' line (t = seconds from recording start)."""
+        """Append a '[HH:MM:SS] text' line (t = seconds from the start of the recording)."""
     def finalize(self, path: str, duration_s: float) -> None:
-        """frontmatter status: done + duration."""
-    def list_notes(self) -> list[dict]: ...   # [{path,title,start,status}]
+        """Set frontmatter status: done + duration."""
+    def replace_transcript(self, path: str, segments: list) -> None:
+        """Replace the transcript section with the higher-quality re-transcription
+        (used by the post-processor); records the model quality and speaker labels."""
+    def list_notes(self) -> list[dict]: ...   # [{path, title, start, status}]
+    # index.jsonl: index_add / index_mark_final keep a lightweight machine-readable index.
 ```
+
+The note body and frontmatter use a few Czech literals because they appear in the
+output files themselves: the `## Přepis` ("Transcript") heading and the
+`--- pokračování ---` ("continuation") restart marker.
 
 ### audio_capture.py  (Windows-only; imported lazily so tests run on Linux)
 
 ```python
 class AudioCapture:
-    """Captures default speaker loopback + default mic via `soundcard` lib.
-    Two threads; mixes to mono float32 @ cfg.sample_rate (resample via numpy linear interp
-    from native rate). Emits chunks of cfg.chunk_seconds to a callback."""
+    """Captures the default speaker loopback + the default microphone via the
+    `soundcard` lib. Two threads; mixes to mono float32 @ cfg.sample_rate
+    (resampled from the native rate with numpy linear interpolation). Emits chunks
+    of cfg.chunk_seconds to a callback."""
     def __init__(self, cfg: AppConfig, on_chunk: Callable[[np.ndarray, float], None]):
         """on_chunk(samples_mono_f32_16k, chunk_start_offset_seconds)"""
     def start(self) -> None: ...
-    def stop(self) -> float: ...   # returns total duration seconds
+    def stop(self) -> float: ...   # returns the total duration in seconds
     @property
     def is_running(self) -> bool: ...
 ```
+
+The recorder also keeps the raw stereo audio (channel 0 = microphone, channel 1 =
+loopback) so the post-processor can attribute speakers later.
 
 ### transcriber.py
 
 ```python
 class Transcriber:
-    """Owns faster_whisper.WhisperModel (lazy-load on first use, models/ dir,
-    device='cpu', compute_type='int8'). Background worker thread consumes a
-    queue.Queue of (samples, offset_s); calls on_segments(list[(t0,t1,text)]).
-    language=cfg.language, vad_filter=True, beam_size=1 for live."""
+    """Owns a faster_whisper.WhisperModel (lazy-loaded on first use, models/ dir,
+    device='cpu', compute_type='int8'). A background worker thread consumes a
+    queue.Queue of (samples, offset_s) and calls on_segments(list[(t0,t1,text)]).
+    language=cfg.language, vad_filter=True, beam_size=1 for the live pass."""
     def __init__(self, cfg: AppConfig, on_segments: Callable[[list[tuple[float,float,str]]], None]): ...
     def submit(self, samples: "np.ndarray", offset_s: float) -> None: ...
     def start(self) -> None: ...
-    def stop(self, drain: bool = True) -> None: ...   # process remaining queue then exit
+    def stop(self, drain: bool = True) -> None: ...   # process the remaining queue, then exit
     @property
     def queue_depth(self) -> int: ...
 ```
@@ -174,12 +217,12 @@ class Transcriber:
 
 ```python
 class Recorder:
-    """State machine. Dependencies injected (capture_factory, transcriber_factory,
-    note_store) -> unit-testable with fakes.
-    start(meeting): create note, start transcriber+capture, state=RECORDING.
+    """State machine. Dependencies are injected (capture_factory, transcriber_factory,
+    note_store), so it is unit-testable with fakes.
+    start(meeting): create the note, start the transcriber + capture, state=RECORDING.
     on_chunk -> transcriber.submit ; on_segments -> store.append_segment.
     stop(): capture.stop, transcriber.stop(drain=True), store.finalize, state=IDLE.
-    Emits state changes + new segments via simple callback lists (UI subscribes)."""
+    Emits state changes + new segments via simple callback lists (the UI subscribes)."""
     def __init__(self, cfg, note_store, capture_factory=None, transcriber_factory=None): ...
     state: RecorderState
     current_meeting: Meeting | None
@@ -190,40 +233,78 @@ class Recorder:
     def start_manual(self, title: str = "Ruční záznam") -> None: ...  # synthesizes a Meeting
     on_state_changed: list[Callable[[RecorderState], None]]
     on_segment: list[Callable[[float, float, str], None]]
+    on_finished: list[Callable[[str, str], None]]   # (note_path, wav_path) when recording ends
 ```
+
+### post_processor.py
+
+```python
+class PostProcessor:
+    """After a meeting ends, re-transcribe the saved WAV with the higher-quality
+    cfg.post_model (e.g. 'large-v3-turbo'), replace the transcript section in the note,
+    attribute speakers from the stereo channels, and delete the WAV. Runs in a daemon
+    thread; the model is created lazily on the first task and reused afterwards."""
+    def __init__(self, cfg, note_store, transcribe_factory=None, on_event=None): ...
+    def start(self) -> None: ...
+    def stop(self, drain: bool = False) -> None: ...
+    def enqueue(self, note_path: str, wav_path: str) -> None: ...   # no-op if post_model is ""
+    def scan_orphans(self, notes_dir: str) -> int:
+        """Find *.wav files that still have a matching .md (interrupted runs) and
+        enqueue them; returns the count. Lets a restart finish unfinished work."""
+    pending: int          # tasks waiting in the queue
+    current: str | None   # the note currently being re-transcribed
+    busy: bool
+```
+
+Speaker attribution compares per-segment RMS energy of the microphone channel
+versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
+"Ostatní" ("Others"). Mono recordings (older format) get no speaker label.
 
 ### UI (PySide6)
 
-- `MainWindow(cfg, calendar_service, recorder)`:
-  - Left: `MeetingListWidget` — today + 7 days; row = time, title, platform icon (M/T),
-    highlight current/next; red dot on the one being recorded.
-  - Right: `CallPanel` — when RECORDING: title, elapsed timer (QTimer 1s), red "● NAHRÁVÁ SE",
-    live transcript (QPlainTextEdit, append-only, autoscroll), Stop button.
-    When idle: next meeting info + "Nahrát teď" (manual) + countdown to auto-start.
-  - Status bar: calendar last refresh / error; transcriber queue depth.
-  - Tray icon: state color, double-click restore; close button minimizes to tray, tray menu Quit.
-  - First-run dialog: asks for ICS URL, saves config.
-- Main loop: QTimer every 5 s -> `pick_action(...)` -> recorder start/stop; QTimer poll_minutes -> calendar refresh (in QThread to avoid UI block).
-- All UI text in Czech.
+- `MainWindow(cfg, calendar_service, recorder, post_processor=None)`:
+  - Left: `MeetingListWidget` — today + 7 days as cards: time, title, platform icon
+    (M/T), highlight current/next, red dot on the one being recorded.
+  - Right: `CallPanel` — when RECORDING: title, an elapsed timer (QTimer, 1 s), a red
+    "● NAHRÁVÁ SE" ("recording") indicator, a live transcript (QPlainTextEdit,
+    append-only, autoscroll), and a Stop button. When idle: next-meeting info, a
+    "Nahrát teď" ("Record now") button, and a countdown to the auto-start.
+  - Status bar: calendar last refresh / error; a "⏳ Dopřepisuji…" ("re-transcribing")
+    indicator while the post-processor is busy.
+  - Tray icon: colour reflects state (grey idle / red recording / orange
+    re-transcribing); double-click restores the window; the close button minimizes to
+    the tray; the tray menu has Quit.
+  - First-run dialog: asks for the secret ICS URL and saves the config.
+- `theme.py` applies a shared light/dark theme (it follows the Windows setting and
+  uses an indigo accent).
+- Main loop: a QTimer every 5 s -> `pick_action(...)` -> recorder start/stop, plus the
+  call-detection tick; a QTimer every `poll_minutes` -> calendar refresh (in a QThread
+  so the UI never blocks).
+- All in-app UI text is in Czech.
 
 ## Threading model
 
-- Qt main thread: UI + scheduler tick (cheap, pure function).
-- Capture: 2 daemon threads (loopback, mic) inside AudioCapture.
-- Transcriber: 1 worker thread (Whisper CPU-bound; chunk of 20 s transcribes in ~5–15 s
-  with `small` int8 on this CPU — keeps up live; queue drains on stop).
-- Calendar refresh: QThread worker.
-- Note appends happen on transcriber thread — NoteStore must use simple `open(...,'a')`
-  per call (atomic enough; single writer).
+- Qt main thread: the UI + the scheduler tick (cheap, a pure function).
+- Capture: 2 daemon threads (loopback, microphone) inside AudioCapture.
+- Transcriber (live): 1 worker thread. Whisper is CPU-bound; a 20 s chunk transcribes
+  in roughly 5–15 s with the `small` int8 model on this CPU, so it keeps up live and
+  the queue drains on stop.
+- Post-processor: 1 daemon thread that re-transcribes finished recordings.
+- Calendar refresh: a QThread worker.
+- Note appends happen on the transcriber thread — NoteStore uses a simple
+  `open(..., 'a')` per call (atomic enough; single writer).
 
 ## Failure handling
 
-- ICS fetch fails -> keep last good list, show error in status bar.
-- soundcard device missing -> recorder error state, message in CallPanel.
-- Whisper model download (first run) -> status in CallPanel ("Stahuji model…"), capture
-  buffers to queue meanwhile.
-- App restart mid-meeting -> scheduler sees in-progress meeting -> start() -> NoteStore
-  appends continuation marker.
+- ICS fetch fails -> keep the last good list, show the error in the status bar.
+- soundcard device missing -> recorder error state, message shown in the CallPanel.
+- Whisper model download (first run) -> status shown in the CallPanel ("Stahuji
+  model…"), capture buffers to the queue meanwhile.
+- App restart mid-meeting -> the scheduler sees the in-progress meeting -> start() ->
+  NoteStore appends a continuation marker. Unfinished re-transcriptions are picked up
+  by the post-processor's orphan scan on the next start.
+- Call detection or post-processing errors are caught and logged; one bad task must
+  never crash the worker or the app.
 
 ## requirements.txt
 
@@ -240,20 +321,34 @@ tzdata
 pytest        # dev
 ```
 
-(If any lacks cp314 wheels at deploy time -> fall back to installing Python 3.12 via winget
-and venv on 3.12. Decide at deploy, not in code.)
+## Tests (pytest — run on Linux, with no audio/Whisper imports)
 
-## Tests (pytest, run on Linux — no audio/whisper imports)
+`conftest.py` injects `sys.modules['soundcard'] = MagicMock()` (and the same for
+`faster_whisper`) before the app is imported, and provides fixtures: sample ICS text
+(single + recurring + Meet + Teams + an all-day event to ignore), a temp notes dir,
+and a freeze-time helper. The suite has 87 tests:
 
-- `conftest.py` injects `sys.modules['soundcard']=MagicMock()` and same for `faster_whisper`
-  before app imports; provides fixtures: sample ICS text (single + recurring + Meet + Teams
-  + all-day event to ignore), tmp notes dir, freeze-time helper.
-- test_calendar: parse single/recurring, platform & URL detection, window filter, sort, tz.
-- test_scheduler: arm/start/stop transitions incl. grace, overlap, restart mid-meeting.
-- test_storage: create/append/finalize/restart-append; frontmatter valid; slug ascii.
-- test_recorder: fakes for capture/transcriber -> full happy path + stop drains queue.
+- `test_calendar`: parse single/recurring events, platform & URL detection, window
+  filtering, sort order, time zones.
+- `test_scheduler`: arm/start/stop transitions including grace periods, overlap, and
+  restart mid-meeting.
+- `test_storage`: create/append/finalize/restart-append; valid frontmatter; ascii
+  slug; transcript replacement and the index.jsonl helpers.
+- `test_recorder`: fakes for capture/transcriber -> full happy path + stop drains the
+  queue.
+- `test_call_detector`: the pure `detect_label` logic — nothing active, Teams
+  (packaged + unpackaged), browsers, priority, case-insensitivity.
+- `test_post_processor`: happy path replaces the transcript and deletes the WAV, a
+  transcription error keeps the WAV and the worker survives, orphan scan, and stereo
+  vs. mono speaker attribution.
+
+Run them with:
+
+```bat
+.venv\Scripts\python.exe -m pytest -q
+```
 
 ## Integration with Claude
 
-Notes land in `C:\temp\Claude\meeting-notetaker\notes\*.md` — already inside the mounted
-folder, so Claude reads them directly. No MCP needed (can be added later).
+Notes land in `notes/*.md` inside the mounted folder, so Claude can read them
+directly — no MCP is needed (one could be added later).

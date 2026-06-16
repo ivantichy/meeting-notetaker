@@ -22,3 +22,9 @@ notes/*
 
 # Pomocný náhledový skript vzhledu (vývoj)
 _theme_preview.py
+
+# Windows installer build artefacts (PyInstaller + Inno Setup)
+build/
+dist/
+packaging/windows/Output/
+# PyInstaller spec is kept in git for reproducible builds; ignore its work dir only.
