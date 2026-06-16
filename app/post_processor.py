@@ -134,22 +134,38 @@ class PostProcessor:
         )
         self._thread.start()
 
-    def stop(self, drain: bool = False) -> None:
-        """Nastaví stop flag a počká na worker (join timeout 10 s).
+    def stop(self, drain: bool = False, timeout: float = 10.0) -> None:
+        """Nastaví stop flag a počká na worker (join ``timeout`` s).
 
         drain=False (výchozí): rozdělané úkoly nechá ve frontě — orphan scan
         je dožene po dalším startu aplikace. drain=True: nejdřív dokončí frontu.
+        Mrtvé vlákno se nejoinuje. (M8: při ukončení appky s rozdělaným přepisem
+        volá main.py drain=True s velkorysým timeoutem.)
         """
         self._drain = drain
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=10)
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
 
     def enqueue(self, note_path: str, wav_path: str) -> None:
-        """Přidá úkol do fronty. No-op pokud cfg.post_model je '' (vypnuto)."""
+        """Přidá úkol do fronty. Když je post-processing vypnutý (cfg.post_model
+        == ''), WAV se rovnou smaže — jinak by syrový zvuk zůstal trvale ležet
+        vedle poznámky (H2: politika retence WAV nezávisí na post-processingu)."""
         if not self.cfg.post_model:
+            self._discard_wav(wav_path)
             return
         self._queue.put((note_path, wav_path))
+
+    @staticmethod
+    def _discard_wav(wav_path: str) -> None:
+        """Smaže WAV (úklid soukromých dat). Chybu jen zaloguje."""
+        try:
+            if wav_path and os.path.exists(wav_path):
+                os.remove(wav_path)
+                log.info("WAV smazán (post-processing vypnutý): %s", wav_path)
+        except OSError:
+            log.exception("Smazání WAV (vypnutý post-processing) selhalo: %s", wav_path)
 
     def scan_orphans(self, notes_dir: str) -> int:
         """Najde v notes_dir soubory *.wav, k nimž existuje stejnojmenné .md;
@@ -223,12 +239,27 @@ class PostProcessor:
             self._transcribe = self._transcribe_factory()
         segments = self._transcribe(mono)
         labeled = _attribute_speakers(channels, framerate, segments)
-        self.note_store.replace_transcript(note_path, labeled)
+        replaced = self.note_store.replace_transcript(note_path, labeled)
+
+        if not replaced:
+            # M5: finální přepis byl prázdný/výrazně horší — necháváme živý
+            # přepis i WAV (nemažeme), ať se data neztratí. WAV zůstává pro
+            # případný ruční přepis; orphan scan ho sice znovu zařadí, ale
+            # příště se opět přeskočí (ohraničené, neškodné).
+            log.warning(
+                "Finální přepis %s zahozen (prázdný/kratší než živý) — "
+                "ponechávám živý přepis a WAV.",
+                name,
+            )
+            self._on_event("PŘEPIS PRESKOCEN", f"{name} (finální horší než živý)")
+            return
+
         try:
             self.note_store.index_mark_final(note_path)
         except Exception:  # noqa: BLE001 - index je bonus
             log.exception("Aktualizace index.jsonl selhala.")
-        os.remove(wav_path)
+        # WAV mažeme až po úspěšném nahrazení přepisu (H2 + M5).
+        self._discard_wav(wav_path)
 
         elapsed = time.monotonic() - t_start
         log.info(

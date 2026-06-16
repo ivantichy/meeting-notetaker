@@ -5,6 +5,7 @@ Celodenní události se přeskakují. Časy jsou tz-aware v lokální časové z
 """
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta
 
@@ -15,6 +16,16 @@ from icalendar import Calendar
 from app.config import AppConfig
 from app.models import Meeting, Platform
 
+log = logging.getLogger(__name__)
+
+
+class CalendarError(Exception):
+    """Chyba kalendáře BEZ tajné ICS URL — bezpečná pro UI i log (C1).
+
+    Výjimky z ``requests``/``urllib3`` totiž nesou celou URL včetně tajného
+    tokenu; tu nesmíme nikdy pustit do status baru ani do notetaker.log.
+    """
+
 # meet.google.com/abc-defg-hij (+ případné query parametry)
 _MEET_RE = re.compile(r"https?://meet\.google\.com/[A-Za-z0-9\-._]+(?:\?[^\s<>\"']*)?")
 # teams.microsoft.com/l/meetup-join/... nebo teams.live.com/...
@@ -24,11 +35,32 @@ _TEAMS_RE = re.compile(
 
 
 def fetch_ics(url: str, timeout: int = 15) -> str:
-    """Stáhne ICS text ze zadané (tajné) URL."""
+    """Stáhne ICS text ze zadané (tajné) URL.
+
+    Při jakékoli chybě vyhodí ``CalendarError`` BEZ URL (C1) — výjimky z
+    requests/urllib3 jinak obsahují celou adresu včetně tajného tokenu.
+    Přesměrování (3xx) se NEnásleduje (M1): tajemství by mohlo uniknout na
+    jiný host nebo přejít na nešifrované http. TLS ověření je explicitně
+    zapnuté.
+    """
     import requests  # lazy import — testy jej nepotřebují
 
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(
+            url, timeout=timeout, allow_redirects=False, verify=True
+        )
+    except requests.exceptions.RequestException as exc:
+        # NIKDY nepouštět str(exc) / URL ven — jen typ chyby.
+        raise CalendarError(
+            f"Síťová chyba při stahování kalendáře ({type(exc).__name__})."
+        ) from None
+    if resp.is_redirect or resp.is_permanent_redirect or 300 <= resp.status_code < 400:
+        raise CalendarError(
+            f"Kalendář vrátil přesměrování (HTTP {resp.status_code}); "
+            "přesměrování se z bezpečnostních důvodů nenásleduje."
+        ) from None
+    if resp.status_code >= 400:
+        raise CalendarError(f"Kalendář vrátil chybu HTTP {resp.status_code}.") from None
     return resp.text
 
 
@@ -98,36 +130,45 @@ def parse_meetings(ics_text: str, window_days: int = 7) -> "list[Meeting]":
 
     meetings: "list[Meeting]" = []
     for event in occurrences:
-        dtstart = event.get("DTSTART")
-        if dtstart is None:
-            continue
-        start_raw = dtstart.dt
-        if not isinstance(start_raw, datetime):
-            # celodenní událost (jen datum) -> ignorovat
-            continue
-        start = _to_local(start_raw)
+        # M3: jedna vadná (typicky rekurentní) událost nesmí shodit parsování
+        # celého kalendáře — jinak by se kalendář tiše přestal aktualizovat.
+        try:
+            dtstart = event.get("DTSTART")
+            if dtstart is None:
+                continue
+            start_raw = dtstart.dt
+            if not isinstance(start_raw, datetime):
+                # celodenní událost (jen datum) -> ignorovat
+                continue
+            start = _to_local(start_raw)
 
-        dtend = event.get("DTEND")
-        if dtend is not None and isinstance(dtend.dt, datetime):
-            end = _to_local(dtend.dt)
-        else:
-            end = start + timedelta(hours=1)
+            dtend = event.get("DTEND")
+            if dtend is not None and isinstance(dtend.dt, datetime):
+                end = _to_local(dtend.dt)
+            else:
+                end = start + timedelta(hours=1)
+            # M3: ochrana proti nevalidnímu/nulovému trvání (DTEND <= DTSTART).
+            if end <= start:
+                end = start + timedelta(hours=1)
 
-        platform, join_url = _detect_platform(event)
-        ics_uid = str(event.get("UID", ""))
-        title = str(event.get("SUMMARY", "")) or "Bez názvu"
+            platform, join_url = _detect_platform(event)
+            ics_uid = str(event.get("UID", ""))
+            title = str(event.get("SUMMARY", "")) or "Bez názvu"
 
-        meetings.append(
-            Meeting(
-                uid=f"{ics_uid}:{start.isoformat()}",
-                title=title,
-                start=start,
-                end=end,
-                platform=platform,
-                join_url=join_url,
-                attendees=_attendees(event),
+            meetings.append(
+                Meeting(
+                    uid=f"{ics_uid}:{start.isoformat()}",
+                    title=title,
+                    start=start,
+                    end=end,
+                    platform=platform,
+                    join_url=join_url,
+                    attendees=_attendees(event),
+                )
             )
-        )
+        except Exception:  # noqa: BLE001 - přeskočit vadnou událost, ostatní zpracovat
+            log.warning("Přeskakuji nečitelnou událost v kalendáři.", exc_info=True)
+            continue
 
     meetings.sort(key=lambda m: m.start)
     return meetings
@@ -142,13 +183,26 @@ class CalendarService:
         self._last_error: "str | None" = None
 
     def refresh(self) -> "list[Meeting]":
-        """Stáhne a naparsuje ICS; při chybě sítě ponechá poslední dobrý výsledek."""
+        """Stáhne a naparsuje ICS; při chybě sítě ponechá poslední dobrý výsledek.
+
+        ``_last_error`` nikdy neobsahuje ICS URL (C1): u ``CalendarError`` je
+        zpráva už bezpečná (sestavená bez URL), u ostatních výjimek ukládáme
+        jen typ chyby. Logujeme rovněž jen typ — ne ``str(exc)``.
+        """
         try:
             text = fetch_ics(self._cfg.ics_url)
             self._meetings = parse_meetings(text)
             self._last_error = None
-        except Exception as exc:  # network / parse error -> keep last good
-            self._last_error = str(exc)
+        except CalendarError as exc:
+            self._last_error = str(exc)  # bez URL (viz fetch_ics)
+            log.warning("Aktualizace kalendáře selhala: %s", type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001 - parse apod.; NIKDY nepouštět detail
+            self._last_error = (
+                f"Kalendář se nepodařilo zpracovat ({type(exc).__name__})."
+            )
+            log.warning(
+                "Aktualizace kalendáře selhala: %s", type(exc).__name__
+            )
         return self._meetings
 
     @property

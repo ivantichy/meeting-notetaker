@@ -1,6 +1,6 @@
 {
   "ics_url": "",
-  "language": "auto",
+  "language": "cs",
   "live_model": "small",
   "post_model": "large-v3-turbo",
   "notes_dir": "notes",
@@ -11,6 +11,6 @@
   "sample_rate": 16000,
   "detect_calls": true,
   "detect_stop_grace_s": 20,
-  "early_stop_grace_s": 20,
+  "early_stop_grace_s": 60,
   "no_call_timeout_s": 180
 }

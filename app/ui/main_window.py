@@ -20,10 +20,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.models import RecorderState
-from app.scheduler import pick_action
+from app.scheduler import evaluate_calendar_call, gate_start_on_call, pick_action
 from app.ui.call_panel import CallPanel
 from app.ui.meeting_list import MeetingListWidget
 from app.ui.onboarding import IcsSetupDialog
+from app.ui.theme import STATUS_ERROR, STATUS_PROCESSING
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class _Bridge(QObject):
 
     state_changed = Signal(str)
     segment = Signal(float, float, str)
+    device_error = Signal(str)  # výpadek zvukového zařízení během záznamu (H5)
 
 
 class _CalendarWorker(QThread):
@@ -90,7 +92,14 @@ class MainWindow(QMainWindow):
         self._call_seen_in_recording: bool = False
         self._call_last_seen: float = 0.0
         self._last_recording_uid: str | None = None
-        self._stopped_uids: set[str] = set()  # meetingy, které už nemáme znovu spouštět
+        #: uid -> monotonic čas, do kdy daný meeting znovu nespouštět (cooldown).
+        #: Brání restartu záznamu každých 5 s až do konce události, ale po
+        #: vypršení cooldownu umožní pozdní příchod / reconnect znovu nahrát (H7).
+        self._stopped_until: dict[str, float] = {}
+        #: Po jak dlouho po zastavení daný uid znovu nearmovat (s).
+        self._restart_cooldown_s: float = 600.0
+        #: poslední chyba zařízení zobrazená uživateli (rate-limit, L4)
+        self._last_device_error_ts: float = 0.0
 
         self.setWindowTitle("Meeting Notetaker")
         self.resize(1000, 640)
@@ -109,7 +118,9 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Načítám kalendář…")
         self._post_label = QLabel("")
-        self._post_label.setStyleSheet("color: #fb8c00; padding-right: 6px;")
+        self._post_label.setStyleSheet(
+            f"color: {STATUS_PROCESSING}; padding-right: 6px;"
+        )
         self.statusBar().addPermanentWidget(self._post_label)
 
         # --- horní lišta -----------------------------------------------------
@@ -133,11 +144,18 @@ class MainWindow(QMainWindow):
         self._bridge.segment.connect(
             self._on_segment, Qt.ConnectionType.QueuedConnection
         )
+        self._bridge.device_error.connect(
+            self._on_device_error, Qt.ConnectionType.QueuedConnection
+        )
         recorder.on_state_changed.append(
             lambda s: self._bridge.state_changed.emit(getattr(s, "value", str(s)))
         )
         recorder.on_segment.append(
             lambda t0, t1, text: self._bridge.segment.emit(float(t0), float(t1), text)
+        )
+        # H5: výpadek zařízení (z capture vlákna) marshalovat do UI vlákna.
+        recorder.on_device_error.append(
+            lambda msg: self._bridge.device_error.emit(str(msg))
         )
 
         # --- tray ------------------------------------------------------------
@@ -207,7 +225,7 @@ class MainWindow(QMainWindow):
     def _on_calendar_refreshed(self) -> None:
         err = self._calendar.last_error
         if err:
-            self.statusBar().setStyleSheet("color: #e53935;")
+            self.statusBar().setStyleSheet(f"color: {STATUS_ERROR};")
             self.statusBar().showMessage(f"Kalendář: chyba — {err}")
         else:
             self.statusBar().setStyleSheet("")
@@ -220,8 +238,20 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- plánovač
 
+    def _current_call_label(self) -> "str | None":
+        """Aktivní hovor podle mikrofonu — spočítá se JEDNOU za tick a předává
+        se dál (M7: dřív se rekurzivní čtení registru volalo až 3× za tick na
+        UI vlákně). Bez zapnuté detekce vrací None bez sahání do registru."""
+        if not getattr(self._cfg, "detect_calls", True):
+            return None
+        from app.call_detector import active_call
+
+        return active_call()
+
     def _scheduler_tick(self) -> None:
         now = datetime.now(tz=tzlocal())
+        # M7: jedno čtení stavu mikrofonu na celý tick (sdílí start/stop/detektor).
+        call_label = self._current_call_label()
         try:
             action, meeting = pick_action(
                 now,
@@ -234,11 +264,19 @@ class MainWindow(QMainWindow):
             log.exception("pick_action selhal")
             return
 
-        # Meeting, který už jednou nahrával a byl zastaven (ručně či
-        # automaticky), znovu nespouštět — jinak plánovač restartuje
-        # záznam každých 5 s až do konce události.
-        if action in ("arm", "start") and meeting is not None and meeting.uid in self._stopped_uids:
-            action = "none"
+        # Meeting, který už jednou nahrával a byl zastaven, po dobu cooldownu
+        # znovu nespouštět — jinak plánovač restartuje záznam každých 5 s až do
+        # konce události. Po vypršení cooldownu (H7) se ale smí znovu armovat,
+        # takže pozdní příchod / reconnect na kalendářovou schůzku se nahraje.
+        if action in ("arm", "start") and meeting is not None:
+            import time as _t
+
+            until = self._stopped_until.get(meeting.uid)
+            if until is not None:
+                if _t.monotonic() < until:
+                    action = "none"
+                else:
+                    del self._stopped_until[meeting.uid]  # cooldown vypršel
 
         if action == "arm":
             self._armed_uid = meeting.uid if meeting else None
@@ -248,14 +286,14 @@ class MainWindow(QMainWindow):
             # Nezačínat "naslepo" v čase události: počkat, až se hovor
             # skutečně rozběhne (Teams/prohlížeč drží mikrofon). Bez toho
             # vznikaly prázdné záznamy meetingů, na které se Ivan nepřipojil.
-            if getattr(self._cfg, "detect_calls", True):
-                from app.call_detector import active_call
-
-                if active_call() is None:
-                    self._armed_uid = meeting.uid if meeting else None
-                    self._meeting_list.set_armed_uid(self._armed_uid)
-                    self._call_panel.set_next_meeting(meeting, armed=True)
-                    return
+            # Rozhodnutí je čistá funkce (H7); stav mikrofonu z cache (M7).
+            if gate_start_on_call(
+                getattr(self._cfg, "detect_calls", True), call_label is not None
+            ):
+                self._armed_uid = meeting.uid if meeting else None
+                self._meeting_list.set_armed_uid(self._armed_uid)
+                self._call_panel.set_next_meeting(meeting, armed=True)
+                return
             self._armed_uid = None
             self._meeting_list.set_armed_uid(None)
             try:
@@ -271,30 +309,28 @@ class MainWindow(QMainWindow):
             # Kalendářový čas vypršel, ale meeting se může protáhnout:
             # dokud hovor reálně běží (mikrofon v držení Teams/prohlížeče),
             # nahráváme dál. Zastavíme až po uvolnění mikrofonu.
-            if getattr(self._cfg, "detect_calls", True):
-                from app.call_detector import active_call
-
-                if active_call() is not None:
-                    return
+            if call_label is not None:
+                return
             self._call_panel.request_stop()
         else:
             if self._armed_uid is not None and self._recorder.state == RecorderState.IDLE:
                 self._armed_uid = None
                 self._meeting_list.set_armed_uid(None)
             self._update_next_meeting_info()
-            self._detector_tick(now)
+            self._detector_tick(now, call_label)
 
-    def _detector_tick(self, now: datetime) -> None:
+    def _detector_tick(self, now: datetime, label: "str | None") -> None:
         """Auto-detekce hovoru mimo kalendář: aplikace (Teams/prohlížeč)
         právě používá mikrofon -> spustit záznam; po uvolnění mikrofonu
-        (+ grace) záznam zastavit. Záznamy řízené kalendářem nezastavuje."""
+        (+ grace) záznam zastavit. Záznamy řízené kalendářem nezastavuje.
+
+        ``label`` je aktivní hovor spočítaný jednou v ``_scheduler_tick`` (M7).
+        Vlastní rozhodovací logika u kalendářového záznamu je čistá funkce
+        ``evaluate_calendar_call`` ve scheduleru (H7)."""
         if not getattr(self._cfg, "detect_calls", True):
             return
         import time as _time
 
-        from app.call_detector import active_call
-
-        label = active_call()
         state = self._recorder.state
 
         if state == RecorderState.RECORDING:
@@ -302,31 +338,28 @@ class MainWindow(QMainWindow):
             if current is None:
                 return
             if current.uid != self._detector_uid:
-                # Záznam řízený kalendářem: pokud byl hovor během záznamu
-                # aspoň jednou aktivní a pak skončil (mikrofon uvolněn
-                # > early_stop_grace_s), zastavíme dřív než v end+grace.
+                # Záznam řízený kalendářem — osud podle aktivity hovoru řeší
+                # čistá, testovaná funkce evaluate_calendar_call (H7).
                 from app.models import Platform
 
                 if current.platform not in (Platform.MEET, Platform.TEAMS):
                     return  # ruční záznamy nezastavujeme
                 if label:
-                    self._call_seen_in_recording = True
                     self._call_last_seen = _time.monotonic()
-                elif (
-                    self._call_seen_in_recording
-                    and _time.monotonic() - self._call_last_seen
-                    > getattr(self._cfg, "early_stop_grace_s", 60)
-                ):
+                decision, self._call_seen_in_recording = evaluate_calendar_call(
+                    call_active=label is not None,
+                    call_seen=self._call_seen_in_recording,
+                    secs_since_last_call=_time.monotonic() - self._call_last_seen,
+                    elapsed_s=self._recorder.elapsed_s,
+                    early_stop_grace_s=getattr(self._cfg, "early_stop_grace_s", 60),
+                    no_call_timeout_s=getattr(self._cfg, "no_call_timeout_s", 180),
+                )
+                if decision == "stop_early":
                     log.info(
                         "Hovor skončil dřív než kalendářová událost — zastavuji záznam."
                     )
-                    self._call_seen_in_recording = False
                     self._call_panel.request_stop()
-                elif (
-                    not self._call_seen_in_recording
-                    and self._recorder.elapsed_s
-                    > getattr(self._cfg, "no_call_timeout_s", 180)
-                ):
+                elif decision == "stop_no_call":
                     log.info(
                         "Žádný hovor se nerozběhl do %d s — zastavuji záznam "
                         "(uživatel se k meetingu nepřipojil).",
@@ -432,7 +465,14 @@ class MainWindow(QMainWindow):
             current = self._recorder.current_meeting
             self._last_recording_uid = current.uid if current else None
         elif state == RecorderState.IDLE and self._last_recording_uid:
-            self._stopped_uids.add(self._last_recording_uid)
+            import time as _t
+
+            # Cooldown místo trvalého bloku (H7): po vypršení se smí znovu
+            # armovat (pozdní příchod / reconnect). Manuální/detekované záznamy
+            # mají uid "manual:…" a do plánovače nevstupují, takže neškodí.
+            self._stopped_until[self._last_recording_uid] = (
+                _t.monotonic() + self._restart_cooldown_s
+            )
             self._last_recording_uid = None
         self._update_meeting_list()
 
@@ -447,6 +487,28 @@ class MainWindow(QMainWindow):
 
     def _on_segment(self, t0: float, t1: float, text: str) -> None:
         self._call_panel.append_segment(t0, t1, text)
+
+    def _on_device_error(self, message: str) -> None:
+        """Výpadek/odpojení zvukového zařízení uprostřed záznamu (H5): zastavit
+        záznam a upozornit uživatele. Hláška je rate-limitovaná (L4), ať při
+        trvalé chybě nespamuje modály; do status baru píšeme vždy."""
+        import time as _t
+
+        log.warning("Výpadek zvukového zařízení během záznamu: %s", message)
+        self.statusBar().setStyleSheet(f"color: {STATUS_ERROR};")
+        self.statusBar().showMessage("Záznam přerušen — výpadek zvukového zařízení.")
+        if self._recorder.state == RecorderState.RECORDING:
+            self._call_panel.request_stop()
+        now = _t.monotonic()
+        if now - self._last_device_error_ts > 30.0:
+            self._last_device_error_ts = now
+            QMessageBox.warning(
+                self,
+                "Chyba zvukového zařízení",
+                "Záznam byl přerušen, protože zvukové zařízení přestalo být "
+                "dostupné (např. odpojení sluchátek nebo změna výchozího "
+                "zařízení).\n\nDosavadní část záznamu je uložena.",
+            )
 
     def _update_meeting_list(self) -> None:
         recording_uid = None
@@ -523,6 +585,17 @@ class MainWindow(QMainWindow):
                 self._recorder.stop()
             except Exception:  # noqa: BLE001
                 log.exception("Zastavení záznamu při ukončování selhalo")
+        # H6: počkat na doběhnutí kalendářového QThreadu, ať Qt neboří
+        # QApplication/okno, zatímco vlákno běží blokující requests.get
+        # ("QThread: Destroyed while thread is still running" -> pád/zamrznutí).
+        worker = self._calendar_worker
+        if worker is not None:
+            try:
+                worker.requestInterruption()
+                if not worker.wait(2000):
+                    log.warning("Kalendářový worker nedoběhl do 2 s při ukončování.")
+            except Exception:  # noqa: BLE001
+                log.exception("Čekání na kalendářový worker při ukončování selhalo.")
         self._quitting = True
         self._tray.hide()
         QApplication.quit()

@@ -6,16 +6,28 @@ datas = []
 binaries = []
 hiddenimports = ['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets']
 hiddenimports += collect_submodules('soundcard')
-tmp_ret = collect_all('faster_whisper')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('ctranslate2')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('av')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('tokenizers')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('huggingface_hub')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+
+def _collect(pkg, required=True):
+    """collect_all() obalený try/except. Pokud balík chybí, build nespadne
+    při analýze — jen vypíše varování (M11: 'av not found' apod.)."""
+    global datas, binaries, hiddenimports
+    try:
+        d, b, h = collect_all(pkg)
+    except Exception as exc:  # noqa: BLE001
+        msg = f"[spec] collect_all({pkg!r}) selhalo: {exc}"
+        if required:
+            raise RuntimeError(msg) from exc
+        print("WARNING:", msg)
+        return
+    datas += d; binaries += b; hiddenimports += h
+
+
+_collect('faster_whisper')
+_collect('ctranslate2')
+_collect('av', required=False)  # PyAV nemusí být přítomné -> jen varuj, nepadej
+_collect('tokenizers')
+_collect('huggingface_hub')
 
 
 a = Analysis(
@@ -42,7 +54,10 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX vypnuto: komprese nativních DLL (ctranslate2/av/Qt) bývá rozbitá nebo
+    # ji antiviry flagují — build co projde lokálně by mohl na čistém stroji
+    # spadnout (M11). Případné podepsání EXE/setupu řeš přes SignTool po buildu.
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -55,7 +70,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,  # viz EXE výše — UPX na nativních DLL je rizikové (M11)
     upx_exclude=[],
     name='MeetingNotetaker',
 )

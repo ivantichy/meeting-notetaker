@@ -62,14 +62,22 @@ class Recorder:
         self.current_meeting: Meeting | None = None
         self.note_path: str | None = None
 
+        # POZOR: tyto callback listy se volají z PRACOVNÍCH vláken
+        # (transcriber/capture/stop). UI je proto musí marshalovat do svého
+        # vlákna (viz _Bridge v main_window). Nikdy do nich nepřipojuj přímý
+        # dotek widgetu — vznikl by cross-thread bug (L6).
         self.on_state_changed: list[Callable[[RecorderState], None]] = []
         self.on_segment: list[Callable[[float, float, str], None]] = []
         #: Voláno po dokončení záznamu: cb(note_path, wav_path)
         self.on_finished: list[Callable[[str, str], None]] = []
+        #: Voláno z capture vlákna při výpadku zařízení uprostřed záznamu (H5):
+        #: cb(zpráva). UI to marshaluje a zastaví záznam + upozorní uživatele.
+        self.on_device_error: list[Callable[[str], None]] = []
 
         self._capture = None
         self._transcriber = None
         self._started_at: float | None = None
+        self._started_wall: str = ""  # ISO čas startu (L9: deklarováno v __init__)
         self._wav = None
         self._wav_lock = threading.Lock()
         self.wav_path: str | None = None
@@ -78,9 +86,15 @@ class Recorder:
 
     @property
     def elapsed_s(self) -> float:
-        """Sekundy od začátku probíhajícího nahrávání (0.0 mimo nahrávání)."""
-        started = self._started_at
-        if started is None or self.state not in (
+        """Sekundy od začátku probíhajícího nahrávání (0.0 mimo nahrávání).
+
+        Stav i ``_started_at`` čteme jako konzistentní snapshot pod zámkem (L1)
+        — jinak mohl stop souběžně přepsat jedno z polí a vrátit 0.0/zastaralou
+        hodnotu."""
+        with self._lock:
+            started = self._started_at
+            state = self.state
+        if started is None or state not in (
             RecorderState.RECORDING,
             RecorderState.FINALIZING,
         ):
@@ -97,7 +111,13 @@ class Recorder:
             path = self._store.create_note(meeting)
             transcriber = self._transcriber_factory(self._cfg, self._handle_segments)
             capture = self._capture_factory(self._cfg, self._handle_chunk)
+            # Probublání výpadku zařízení uprostřed hovoru (H5), pokud to
+            # capture umí (AudioCapture ano; fake objekty v testech nemusí).
+            if hasattr(capture, "on_device_error"):
+                capture.on_device_error = self._handle_device_error
 
+            # Transcriber se spustí jako první: při selhání načtení modelu (H1)
+            # vyhodí výjimku, kterou volající (plánovač/UI) tvrdě ohlásí.
             transcriber.start()
             try:
                 capture.start()
@@ -246,6 +266,17 @@ class Recorder:
                     cb(t0, t1, text)
                 except Exception:  # noqa: BLE001
                     log.exception("Callback on_segment selhal.")
+
+    def _handle_device_error(self, message: str) -> None:
+        """Voláno z capture vlákna při výpadku zařízení uprostřed záznamu (H5).
+        Jen probublá zprávu do odběratelů (UI) — samotné zastavení musí
+        proběhnout jinde (UI vlákno přes request_stop), ne z capture vlákna."""
+        log.warning("Výpadek zvukového zařízení během záznamu: %s", message)
+        for cb in list(self.on_device_error):
+            try:
+                cb(message)
+            except Exception:  # noqa: BLE001
+                log.exception("Callback on_device_error selhal.")
 
     def _notify_state(self, state: RecorderState) -> None:
         for cb in list(self.on_state_changed):

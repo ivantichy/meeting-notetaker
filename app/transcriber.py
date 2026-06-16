@@ -23,6 +23,14 @@ if TYPE_CHECKING:  # pragma: no cover - jen pro typy
 
 log = logging.getLogger(__name__)
 
+#: Strop fronty živého přepisu. Živý přepis je best-effort (finální vzniká
+#: z WAV), takže při zahlcení (slabé CPU, dlouhý hovor) raději zahazujeme
+#: nejstarší bloky, než aby paměť rostla bez limitu (H1). ~30 bloků = ~10 min
+#: zpoždění při 20s blocích, než začneme zahazovat.
+MAX_QUEUE_CHUNKS = 30
+#: Drain timeout při stop() — výrazně pod původních 120 s (H1).
+DRAIN_TIMEOUT_S = 30.0
+
 
 class Transcriber:
     """Vlastní faster-whisper model + jedno pracovní vlákno nad frontou."""
@@ -31,14 +39,21 @@ class Transcriber:
         self,
         cfg: "AppConfig",
         on_segments: Callable[[list[tuple[float, float, str]]], None],
+        on_error: "Callable[[str], None] | None" = None,
+        model_factory: "Callable[[], object] | None" = None,
     ):
         self._cfg = cfg
         self._on_segments = on_segments
-        self._queue: queue.Queue = queue.Queue()
+        #: Voláno (z vlákna start()) při neúspěšném načtení modelu — UI to má
+        #: tvrdě ohlásit místo nekonečného opakování po blocích (H1).
+        self._on_error = on_error or (lambda msg: None)
+        self._model_factory = model_factory
+        self._queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
         self._stop = threading.Event()
         self._drain = True
         self._thread: threading.Thread | None = None
         self._model = None
+        self._dropped = 0
 
     # ------------------------------------------------------------------ API
 
@@ -47,13 +62,45 @@ class Transcriber:
         return self._queue.qsize()
 
     def submit(self, samples: "np.ndarray", offset_s: float) -> None:
-        self._queue.put((samples, offset_s))
+        """Zařadí blok k přepisu. Při plné frontě (Whisper nestíhá realtime)
+        zahodí nejstarší blok a vloží nový — živý přepis je best-effort, finální
+        stejně vzniká z WAV. Nikdy neblokuje zachytávací vlákno (H1)."""
+        try:
+            self._queue.put_nowait((samples, offset_s))
+        except queue.Full:
+            try:
+                self._queue.get_nowait()  # zahoď nejstarší
+                self._queue.task_done()
+            except queue.Empty:
+                pass
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 10 == 0:
+                log.warning(
+                    "Fronta živého přepisu plná (%d) — zahazuji nejstarší blok "
+                    "(zatím zahozeno %d). Finální přepis vznikne z WAV.",
+                    MAX_QUEUE_CHUNKS,
+                    self._dropped,
+                )
+            try:
+                self._queue.put_nowait((samples, offset_s))
+            except queue.Full:
+                pass
 
     def start(self) -> None:
+        """Spustí pracovní vlákno. Model se postaví HNED (jednou) — když se
+        nepovede (poškozené stažení, plný disk, offline), vyhodí výjimku, aby
+        ji volající (Recorder/UI) tvrdě ohlásil místo tichého opakování (H1)."""
         if self._thread is not None and self._thread.is_alive():
             return
+        try:
+            self._get_model()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Načtení modelu živého přepisu selhalo.")
+            self._on_error(str(exc))
+            raise
         self._stop.clear()
         self._drain = True
+        self._dropped = 0
         self._thread = threading.Thread(
             target=self._worker, name="transcriber", daemon=True
         )
@@ -61,17 +108,22 @@ class Transcriber:
 
     def stop(self, drain: bool = True) -> None:
         """Zastaví pracovní vlákno. Při ``drain=True`` nejprve zpracuje
-        všechny zbývající položky ve frontě. Join s timeoutem 120 s."""
+        zbývající položky ve frontě. Join s timeoutem ``DRAIN_TIMEOUT_S``;
+        mrtvé vlákno se nejoinuje (vrátilo by se hned, ale buďme explicitní)."""
         self._drain = drain
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=120.0)
-            self._thread = None
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=DRAIN_TIMEOUT_S)
 
     # --------------------------------------------------------------- worker
 
     def _get_model(self):
         if self._model is None:
+            if self._model_factory is not None:
+                self._model = self._model_factory()
+                return self._model
             from faster_whisper import WhisperModel  # líný import
 
             import os

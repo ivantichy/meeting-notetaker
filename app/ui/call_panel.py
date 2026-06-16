@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.models import Meeting, RecorderState
+from app.ui.theme import STATUS_PROCESSING, STATUS_RECORDING
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +76,9 @@ class CallPanel(QWidget):
 
         self._countdown_label = QLabel("")
         self._countdown_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._countdown_label.setStyleSheet("color: #e53935; font-weight: bold;")
+        self._countdown_label.setStyleSheet(
+            f"color: {STATUS_RECORDING}; font-weight: bold;"
+        )
         layout.addWidget(self._countdown_label)
 
         self._elapsed_label = QLabel("")
@@ -88,6 +91,9 @@ class CallPanel(QWidget):
         self._transcript = QPlainTextEdit()
         self._transcript.setReadOnly(True)
         self._transcript.setPlaceholderText("Živý přepis se zobrazí zde…")
+        # M6: strop bloků — vícehodinový hovor jinak nahromadí tisíce řádků a
+        # autoscroll na obřím dokumentu se zpomaluje. Plný přepis je stejně v .md.
+        self._transcript.setMaximumBlockCount(2000)
         layout.addWidget(self._transcript, stretch=1)
 
         self._queue_label = QLabel("")
@@ -140,9 +146,13 @@ class CallPanel(QWidget):
 
     def append_segment(self, t0: float, t1: float, text: str) -> None:
         line = f"[{_fmt_hms(t0)}] {text}"
-        self._transcript.appendPlainText(line)
         sb = self._transcript.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        # L3: autoscroll jen když je uživatel u dna — jinak respektuj, že si
+        # odscrolloval nahoru (číst starší část), a nestrhávej ho zpět dolů.
+        at_bottom = sb.value() >= sb.maximum() - 4
+        self._transcript.appendPlainText(line)
+        if at_bottom:
+            sb.setValue(sb.maximum())
 
     def request_stop(self) -> None:
         """Zastaví záznam na pozadí (stop dotahuje frontu přepisu a může trvat)."""
@@ -152,7 +162,7 @@ class CallPanel(QWidget):
         self._button.setEnabled(False)
         self._button.setText("Dokončuji přepis…")
         self._state_label.setText("Dokončuji přepis…")
-        self._state_label.setStyleSheet("color: #fb8c00;")
+        self._state_label.setStyleSheet(f"color: {STATUS_PROCESSING};")
 
         def _worker() -> None:
             err = ""
@@ -199,12 +209,12 @@ class CallPanel(QWidget):
 
         if finalizing:
             self._state_label.setText("Dokončuji přepis…")
-            self._state_label.setStyleSheet("color: #fb8c00;")
+            self._state_label.setStyleSheet(f"color: {STATUS_PROCESSING};")
             self._button.setEnabled(False)
             self._button.setText("Dokončuji přepis…")
         elif recording:
             self._state_label.setText("● NAHRÁVÁ SE")
-            self._state_label.setStyleSheet("color: #e53935;")
+            self._state_label.setStyleSheet(f"color: {STATUS_RECORDING};")
             meeting = getattr(self._recorder, "current_meeting", None)
             self._title_label.setText(meeting.title if meeting else "")
             self._button.setEnabled(True)

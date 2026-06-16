@@ -12,6 +12,14 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import QApplication
 
+#: Sémantické barvy stavů (L5 — centralizované místo roztroušených inline
+#: hodnot). Červená je dle návrhu vyhrazená pro „nahrává se", oranžová pro
+#: dopřepisování; jsou záměrně shodné v obou režimech (dobrá čitelnost na
+#: světlém i tmavém pozadí), proto nepatří do _Scheme.
+STATUS_RECORDING = "#e53935"   # červená: probíhá záznam
+STATUS_PROCESSING = "#fb8c00"  # oranžová: dopřepisování WAV
+STATUS_ERROR = "#e53935"       # červená: chyba
+
 
 class _Scheme:
     """Sada barev jednoho režimu (světlý/tmavý)."""

@@ -32,6 +32,7 @@ class FakeCapture:
         self.stopped = False
         self.duration = 123.0
         self._running = False
+        self.on_device_error = None  # recorder ho nastaví na svůj handler (H5)
 
     def start(self):
         self.started = True
@@ -229,3 +230,72 @@ def test_stop_drains_transcriber(recorder, holder, meeting):
     # a capture se zastavil dřív, než se finalizovalo
     assert holder.capture.stopped
     assert recorder.state is RecorderState.IDLE
+
+
+
+# ------------------------------------------- H8: WAV round-trip + kanály
+
+
+def _read_wav(path):
+    import wave
+
+    with wave.open(path, "rb") as wf:
+        params = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
+        raw = wf.readframes(wf.getnframes())
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    channels = audio.reshape(-1, params[0])
+    return params, channels
+
+
+def test_wav_roundtrip_stereo_channel_order(recorder, holder, meeting, cfg):
+    """Recorder zapíše reálné STEREO; po přečtení zpět musí kanál 0 = mikrofon
+    (Ivan), kanál 1 = loopback (ostatní). Záměna kanálů by přeznačila mluvčí."""
+    recorder.start(meeting)
+    wav_path = recorder.wav_path
+    assert wav_path is not None
+
+    n = cfg.sample_rate  # 1 s
+    mic = np.full(n, 0.5, dtype=np.float32)       # mikrofon hlasitý
+    loop = np.full(n, -0.25, dtype=np.float32)    # loopback tišší, opačná polarita
+    stereo = np.stack([mic, loop], axis=1)
+    holder.capture.emit_chunk(stereo, 0.0)
+
+    recorder.stop()
+
+    (n_channels, sampwidth, framerate), channels = _read_wav(wav_path)
+    assert n_channels == 2
+    assert sampwidth == 2                 # 16bit PCM
+    assert framerate == cfg.sample_rate
+    assert channels.shape == (n, 2)
+    # kanál 0 ~ mic (0.5), kanál 1 ~ loopback (-0.25) — pořadí zachováno
+    assert float(np.mean(channels[:, 0])) == pytest.approx(0.5, abs=1e-3)
+    assert float(np.mean(channels[:, 1])) == pytest.approx(-0.25, abs=1e-3)
+
+
+def test_wav_roundtrip_clips_out_of_range(recorder, holder, meeting, cfg):
+    recorder.start(meeting)
+    wav_path = recorder.wav_path
+    n = cfg.sample_rate
+    loud = np.stack(
+        [np.full(n, 2.0, dtype=np.float32), np.full(n, -2.0, dtype=np.float32)],
+        axis=1,
+    )
+    holder.capture.emit_chunk(loud, 0.0)
+    recorder.stop()
+    _, channels = _read_wav(wav_path)
+    assert channels.max() <= 1.0 and channels.min() >= -1.0
+    assert float(np.mean(channels[:, 0])) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_device_error_callback_propagates(recorder, holder, meeting):
+    """H5: výpadek zařízení (capture.on_device_error) probublá do recorder
+    callbacku on_device_error."""
+    seen = []
+    recorder.on_device_error.append(seen.append)
+    recorder.start(meeting)
+    # FakeCapture nedostane on_device_error atribut nastavený? Recorder ho
+    # nastaví jen pokud existuje — přidáme ho a simulujeme výpadek.
+    assert hasattr(holder.capture, "on_device_error")
+    holder.capture.on_device_error("Zvukové zařízení selhalo (mikrofon): test")
+    assert seen == ["Zvukové zařízení selhalo (mikrofon): test"]
+    recorder.stop()

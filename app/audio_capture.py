@@ -66,9 +66,18 @@ class AudioCapture:
     z mixovacího vlákna pro každý hotový blok délky ``cfg.chunk_seconds``.
     """
 
-    def __init__(self, cfg: "AppConfig", on_chunk: Callable[[np.ndarray, float], None]):
+    def __init__(
+        self,
+        cfg: "AppConfig",
+        on_chunk: Callable[[np.ndarray, float], None],
+        on_device_error: "Callable[[str], None] | None" = None,
+    ):
         self._cfg = cfg
         self._on_chunk = on_chunk
+        #: Voláno z capture vlákna při výpadku/odpojení zařízení UPROSTŘED
+        #: hovoru (H5) — Recorder na to reaguje zastavením + notifikací.
+        #: Volá se max. jednou za běh. None = no-op (zpětná kompatibilita/testy).
+        self.on_device_error: "Callable[[str], None] | None" = on_device_error
 
         self._stop = threading.Event()
         self._buf_lock = threading.Lock()
@@ -145,19 +154,30 @@ class AudioCapture:
         self._stop.set()
         for t in self._capture_threads:
             t.join(timeout=5.0)
-        if self._mixer_thread is not None:
-            self._mixer_thread.join(timeout=10.0)
+        mixer = self._mixer_thread
+        mixer_done = True
+        if mixer is not None:
+            mixer.join(timeout=10.0)
+            mixer_done = not mixer.is_alive()
 
-        # Poslední částečný blok — vypustit, pokud má víc než 1 sekundu.
-        if self._acc_frames > NATIVE_RATE:
-            tail = (
-                np.concatenate(self._acc)
-                if self._acc
-                else np.zeros((0, 2), np.float32)
+        # Stav _acc/_mixed_frames_total vlastní mixovací vlákno. Sahat na něj
+        # smíme až po jeho doběhnutí — jinak race a utržená délka/tail (H5).
+        if mixer_done:
+            # Poslední částečný blok — vypustit, pokud má víc než 1 sekundu.
+            if self._acc_frames > NATIVE_RATE:
+                tail = (
+                    np.concatenate(self._acc)
+                    if self._acc
+                    else np.zeros((0, 2), np.float32)
+                )
+                self._emit(tail)
+            self._acc = []
+            self._acc_frames = 0
+        else:
+            log.warning(
+                "Mixovací vlákno nedoběhlo do timeoutu — přeskakuji tail a "
+                "vracím dosud změřenou délku (zařízení pravděpodobně viselo)."
             )
-            self._emit(tail)
-        self._acc = []
-        self._acc_frames = 0
 
         self._running = False
         self._capture_threads = []
@@ -177,11 +197,19 @@ class AudioCapture:
                     with self._buf_lock:
                         sink.append(mono)
         except Exception as exc:  # noqa: BLE001
-            log.exception("Nepodařilo se otevřít zvukové zařízení (%s).", label)
+            log.exception("Zvukové zařízení selhalo za běhu (%s).", label)
+            first = self._device_error is None
             self._device_error = RuntimeError(
-                f"Nepodařilo se otevřít zvukové zařízení: {exc}"
+                f"Zvukové zařízení selhalo ({label}): {exc}"
             )
             self._stop.set()
+            # Probublat výpadek do Recorderu/UI — jen jednou (H5).
+            cb = self.on_device_error
+            if first and cb is not None:
+                try:
+                    cb(str(self._device_error))
+                except Exception:  # noqa: BLE001 - notifikace nesmí shodit vlákno
+                    log.exception("Callback on_device_error selhal.")
 
     def _mixer_loop(self) -> None:
         while True:

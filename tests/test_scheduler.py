@@ -5,7 +5,7 @@ import pytest
 
 from app.config import AppConfig
 from app.models import Platform, RecorderState
-from app.scheduler import pick_action
+from app.scheduler import evaluate_calendar_call, gate_start_on_call, pick_action
 
 CFG = AppConfig(arm_window_s=120, stop_grace_s=300)
 ARM = timedelta(seconds=CFG.arm_window_s)
@@ -210,3 +210,70 @@ class TestOverlap:
             fixed_now, [current, nxt], RecorderState.IDLE, None, CFG
         )
         assert (action, m.uid) == ("start", "next")
+
+
+# ----------------------------------------- H7: čisté gating funkce z UI
+
+
+class TestGateStartOnCall:
+    def test_no_detection_starts_immediately(self):
+        # bez detekce hovorů se nikdy nepozdržuje
+        assert gate_start_on_call(detect_calls=False, call_active=False) is False
+        assert gate_start_on_call(detect_calls=False, call_active=True) is False
+
+    def test_detection_waits_until_call_active(self):
+        # detekce zapnutá a hovor neběží -> pozdržet (gate=True)
+        assert gate_start_on_call(detect_calls=True, call_active=False) is True
+
+    def test_detection_starts_when_call_active(self):
+        assert gate_start_on_call(detect_calls=True, call_active=True) is False
+
+
+class TestEvaluateCalendarCall:
+    GRACE = 60.0
+    NOCALL = 180.0
+
+    def _eval(self, **kw):
+        base = dict(
+            call_active=False,
+            call_seen=False,
+            secs_since_last_call=0.0,
+            elapsed_s=0.0,
+            early_stop_grace_s=self.GRACE,
+            no_call_timeout_s=self.NOCALL,
+        )
+        base.update(kw)
+        return evaluate_calendar_call(**base)
+
+    def test_active_call_continues_and_sets_seen(self):
+        assert self._eval(call_active=True, call_seen=False) == ("continue", True)
+
+    def test_seen_then_released_within_grace_continues(self):
+        assert self._eval(
+            call_active=False, call_seen=True, secs_since_last_call=30.0
+        ) == ("continue", True)
+
+    def test_seen_then_released_past_grace_stops_early(self):
+        action, seen = self._eval(
+            call_active=False, call_seen=True, secs_since_last_call=61.0
+        )
+        assert action == "stop_early"
+        assert seen is False
+
+    def test_no_call_before_timeout_continues(self):
+        assert self._eval(
+            call_active=False, call_seen=False, elapsed_s=100.0
+        ) == ("continue", False)
+
+    def test_no_call_after_timeout_stops(self):
+        action, seen = self._eval(
+            call_active=False, call_seen=False, elapsed_s=181.0
+        )
+        assert action == "stop_no_call"
+        assert seen is False
+
+    def test_active_call_overrides_long_silence(self):
+        # i po dlouhém tichu: pokud je hovor zase aktivní, pokračuje a resetuje
+        assert self._eval(
+            call_active=True, call_seen=True, secs_since_last_call=9999.0
+        ) == ("continue", True)

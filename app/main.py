@@ -43,9 +43,17 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(False)  # okno se zavírá do oznamovací oblasti
 
     # --- jediná instance ----------------------------------------------------
-    # Zámek v systémovém temp adresáři brání spuštění druhé instance (a tím
-    # dvojímu nahrávání téhož hovoru). Referenci držíme po dobu života procesu.
-    lock_path = os.path.join(tempfile.gettempdir(), "meeting-notetaker.lock")
+    # Zámek brání spuštění druhé instance (a tím dvojímu nahrávání téhož hovoru).
+    # Umístíme ho do uživatelského %LOCALAPPDATA% (per-user, nesdílený) místo do
+    # společného temp — tam by ho na multi-user stroji mohl předem obsadit někdo
+    # jiný (predikovatelné jméno) a zablokovat spuštění (L2). Fallback na temp.
+    lock_dir = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    lock_dir = os.path.join(lock_dir, "MeetingNotetaker")
+    try:
+        os.makedirs(lock_dir, exist_ok=True)
+    except OSError:
+        lock_dir = tempfile.gettempdir()
+    lock_path = os.path.join(lock_dir, "meeting-notetaker.lock")
     lock_file = QLockFile(lock_path)
     lock_file.setStaleLockTime(0)  # zámek po pádu uvolní OS automaticky
     if not lock_file.tryLock(100):
@@ -114,7 +122,16 @@ def main() -> int:
         4000,
     )
     rc = app.exec()
-    post_processor.stop(drain=False)
+    # M8: při ukončení dokonči rozdělaný/zafrontovaný dopřepis (drain=True) s
+    # velkorysým timeoutem — jinak by se hotové meetingy čekající na kvalitní
+    # přepis zahodily (WAV by sice zůstal a orphan scan by je dohnal příště,
+    # ale jen pokud uživatel appku znovu spustí). Co se nestihne, zůstává na
+    # disku pro příští běh.
+    if cfg.post_model and post_processor.busy:
+        log.info("Ukončuji: dokončuji rozdělaný dopřepis (drain).")
+        post_processor.stop(drain=True, timeout=300.0)
+    else:
+        post_processor.stop(drain=False)
     return rc
 
 

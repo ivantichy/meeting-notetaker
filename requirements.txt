@@ -1,10 +1,14 @@
-PySide6
-faster-whisper
-soundcard
-numpy
-requests
-icalendar
-recurring-ical-events
-python-dateutil
-tzdata
-pytest        # dev
+# Runtime dependencies (pinned for reproducible builds — M2).
+# Dev/test tools live in requirements-dev.txt; the full transitive lock with
+# every sub-dependency is in requirements.lock (pip install -r requirements.lock).
+PySide6==6.11.1
+faster-whisper==1.2.1
+soundcard==0.4.6
+numpy==2.4.6
+requests==2.34.2
+icalendar==7.1.2
+recurring-ical-events==3.8.2
+python-dateutil==2.9.0.post0
+tzdata==2026.2
+# Used by faster-whisper (PyAV) and bundled explicitly by the PyInstaller spec.
+av==17.1.0

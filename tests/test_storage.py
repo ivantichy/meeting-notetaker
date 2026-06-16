@@ -307,3 +307,139 @@ def test_replace_transcript_with_speakers(tmp_notes_dir, sample_meeting):
     assert "[00:00:02] Ostatní: Dobrý den i vám." in text
     assert "[00:00:05] Bez mluvčího." in text
     assert "[00:00:07] Stará trojice." in text
+
+
+# ------------------------------------------------- H3: escapování frontmatteru
+
+
+class TestFrontmatterEscaping:
+    def test_title_with_colon_round_trips(self, tmp_notes_dir, make_meeting, fixed_now):
+        from app.storage import _parse_frontmatter
+
+        store = NoteStore(tmp_notes_dir)
+        m = make_meeting(fixed_now, title="Projekt: kickoff")
+        text = _read(store.create_note(m))
+        # frontmatter zůstává validní (uzavřený druhým '---') a hodnota se vrátí celá
+        meta = _parse_frontmatter(text)
+        assert meta["title"] == "Projekt: kickoff"
+        assert meta.get("status") == "recording"
+
+    def test_title_with_newline_does_not_break_block(
+        self, tmp_notes_dir, make_meeting, fixed_now
+    ):
+        from app.storage import _parse_frontmatter
+
+        store = NoteStore(tmp_notes_dir)
+        m = make_meeting(fixed_now, title="Řádek jedna\nstatus: hacked\nplatform: x")
+        text = _read(store.create_note(m))
+        meta = _parse_frontmatter(text)
+        # injektovaný 'status: hacked' se NEpropíše — newline byl odstraněn
+        assert meta.get("status") == "recording"
+        assert meta.get("platform") == "meet"
+        assert "hacked" in meta["title"]  # zůstává jako součást titulku, ne jako klíč
+
+    def test_attendee_with_special_chars_round_trips(
+        self, tmp_notes_dir, make_meeting, fixed_now
+    ):
+        from app.storage import _parse_frontmatter
+
+        store = NoteStore(tmp_notes_dir)
+        m = make_meeting(
+            fixed_now, attendees=["a: b@x.com", "#funny@x.com", "norm@x.com"]
+        )
+        text = _read(store.create_note(m))
+        meta = _parse_frontmatter(text)
+        assert meta["attendees"] == ["a: b@x.com", "#funny@x.com", "norm@x.com"]
+
+    def test_plain_title_stays_unquoted(self, tmp_notes_dir, sample_meeting):
+        # běžný název bez problematických znaků se NEuvozovkuje (čitelnost)
+        store = NoteStore(tmp_notes_dir)
+        text = _read(store.create_note(sample_meeting))
+        assert f"title: {sample_meeting.title}" in text.split("\n")
+
+
+# ------------------------------------------------- H4: kolize slugů
+
+
+class TestSlugCollision:
+    def test_same_meeting_restart_reuses_file(self, tmp_notes_dir, sample_meeting):
+        store = NoteStore(tmp_notes_dir)
+        p1 = store.create_note(sample_meeting)
+        p2 = store.create_note(sample_meeting)  # restart téže schůzky
+        assert p1 == p2
+        assert "--- pokračování záznamu ---" in _read(p1)
+
+    def test_different_meeting_same_slug_gets_suffix(
+        self, tmp_notes_dir, make_meeting, fixed_now
+    ):
+        store = NoteStore(tmp_notes_dir)
+        # dvě RŮZNÉ schůzky ve stejnou minutu se stejným (prázdným) názvem
+        m1 = make_meeting(fixed_now, title="???", uid="uid-1")
+        m2 = make_meeting(fixed_now, title="???", uid="uid-2")
+        p1 = store.create_note(m1)
+        p2 = store.create_note(m2)
+        assert p1 != p2
+        assert p2.endswith("_2.md")
+        # přepisy se neslévají: každý soubor má svůj uid
+        assert "uid-1" in _read(p1)
+        assert "uid-2" in _read(p2)
+        # a žádný neobsahuje marker pokračování (nešlo o restart)
+        assert "pokračování" not in _read(p2)
+
+    def test_third_collision_gets_suffix_3(
+        self, tmp_notes_dir, make_meeting, fixed_now
+    ):
+        store = NoteStore(tmp_notes_dir)
+        p1 = store.create_note(make_meeting(fixed_now, title="x", uid="u1"))
+        p2 = store.create_note(make_meeting(fixed_now, title="x", uid="u2"))
+        p3 = store.create_note(make_meeting(fixed_now, title="x", uid="u3"))
+        assert {os.path.basename(p1), os.path.basename(p2), os.path.basename(p3)} == {
+            f"{make_meeting(fixed_now, title='x').slug}.md",
+            f"{make_meeting(fixed_now, title='x').slug}_2.md",
+            f"{make_meeting(fixed_now, title='x').slug}_3.md",
+        }
+
+
+# ------------------------------------------------- M5: nezahodit lepší přepis
+
+
+class TestReplaceTranscriptGuard:
+    def test_empty_final_keeps_live_transcript(self, tmp_notes_dir, sample_meeting):
+        store = NoteStore(tmp_notes_dir)
+        path = store.create_note(sample_meeting)
+        store.append_segment(path, 0.0, 5.0, "Použitelný živý přepis tady.")
+        result = store.replace_transcript(path, [])  # prázdný finální
+        assert result is False
+        text = _read(path)
+        assert "Použitelný živý přepis tady." in text  # živý zachován
+        # transcript_quality se NEnastavil (nahrazení neproběhlo)
+        assert "transcript_quality: final" not in text
+
+    def test_much_shorter_final_is_skipped(self, tmp_notes_dir, sample_meeting):
+        store = NoteStore(tmp_notes_dir)
+        path = store.create_note(sample_meeting)
+        for i in range(10):
+            store.append_segment(path, float(i), float(i) + 1, "Dlouhá smysluplná věta.")
+        result = store.replace_transcript(path, [(0.0, 1.0, "x")])  # 1 znak vs ~230
+        assert result is False
+        assert _read(path).count("Dlouhá smysluplná věta.") == 10
+
+    def test_comparable_final_replaces(self, tmp_notes_dir, sample_meeting):
+        store = NoteStore(tmp_notes_dir)
+        path = store.create_note(sample_meeting)
+        store.append_segment(path, 0.0, 2.0, "Živý přepis první verze.")
+        result = store.replace_transcript(
+            path, [(0.0, 2.0, "Finální přepis lepší verze tady.")]
+        )
+        assert result is True
+        text = _read(path)
+        assert "Finální přepis lepší verze tady." in text
+        assert "Živý přepis první verze." not in text
+        assert "transcript_quality: final" in text
+
+    def test_atomic_write_leaves_no_tmp(self, tmp_notes_dir, sample_meeting):
+        store = NoteStore(tmp_notes_dir)
+        path = store.create_note(sample_meeting)
+        store.replace_transcript(path, [(0.0, 1.0, "Věta dostatečně dlouhá pro test.")])
+        leftovers = [n for n in os.listdir(tmp_notes_dir) if ".tmp." in n]
+        assert leftovers == []

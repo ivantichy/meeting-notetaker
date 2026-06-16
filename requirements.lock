@@ -1,0 +1,61 @@
+# Fully pinned transitive lock (pip freeze) for reproducible builds — M2.
+# Generated on Windows / CPython 3.14. Install with:
+#   pip install -r requirements.lock
+# Regenerate after dependency changes with:
+#   pip freeze > requirements.lock
+altgraph==0.17.5
+annotated-doc==0.0.4
+anyio==4.13.0
+av==17.1.0
+certifi==2026.5.20
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.4.1
+colorama==0.4.6
+ctranslate2==4.8.0
+faster-whisper==1.2.1
+filelock==3.29.3
+flatbuffers==25.12.19
+fsspec==2026.4.0
+h11==0.16.0
+hf-xet==1.5.1
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.19.0
+icalendar==7.1.2
+idna==3.18
+iniconfig==2.3.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+numpy==2.4.6
+onnxruntime==1.26.0
+packaging==26.2
+pefile==2024.8.26
+pluggy==1.6.0
+protobuf==7.35.1
+pycparser==3.0
+Pygments==2.20.0
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+PySide6==6.11.1
+PySide6_Addons==6.11.1
+PySide6_Essentials==6.11.1
+pytest==9.0.3
+python-dateutil==2.9.0.post0
+pywin32-ctypes==0.2.3
+PyYAML==6.0.3
+recurring-ical-events==3.8.2
+requests==2.34.2
+rich==15.0.0
+setuptools==82.0.1
+shellingham==1.5.4
+shiboken6==6.11.1
+six==1.17.0
+SoundCard==0.4.6
+tokenizers==0.23.1
+tqdm==4.68.2
+typer==0.25.1
+typing_extensions==4.15.0
+tzdata==2026.2
+urllib3==2.7.0
+x-wr-timezone==2.0.1

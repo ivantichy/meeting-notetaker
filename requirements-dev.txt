@@ -1,0 +1,4 @@
+# Development / test / packaging tools (kept out of the runtime requirements).
+-r requirements.txt
+pytest==9.0.3
+pyinstaller==6.21.0

@@ -133,9 +133,158 @@ class TestCalendarService:
         assert result == good            # poslední dobrý výsledek zůstal
         assert svc.meetings == good
         assert svc.last_error is not None
-        assert "síť" in svc.last_error
+        # chyba je bezpečná zpráva bez detailu výjimky a hlavně bez URL (C1)
+        assert "secret" not in svc.last_error
+        assert "ConnectionError" in svc.last_error
 
     def test_initial_state(self):
         svc = CalendarService(AppConfig())
         assert svc.meetings == []
         assert svc.last_error is None
+
+
+# ------------------------------------------- C1: tajná URL nesmí uniknout
+
+
+_SECRET_URL = "https://calendar.example.com/private/SECRETTOKEN123/basic.ics"
+
+
+class _FakeResp:
+    def __init__(self, status_code=200, text="", is_redirect=False):
+        self.status_code = status_code
+        self.text = text
+        self.is_redirect = is_redirect
+        self.is_permanent_redirect = False
+
+
+class TestFetchIcsSecurity:
+    def test_network_error_does_not_leak_url(self, monkeypatch):
+        import requests
+
+        from app import calendar_ics
+
+        def _boom(url, **kw):
+            # reálná requests výjimka nese celou URL ve zprávě
+            raise requests.exceptions.ConnectionError(
+                f"Failed to establish connection to {url}"
+            )
+
+        monkeypatch.setattr(requests, "get", _boom)
+        with pytest.raises(calendar_ics.CalendarError) as ei:
+            calendar_ics.fetch_ics(_SECRET_URL)
+        msg = str(ei.value)
+        assert "SECRETTOKEN123" not in msg
+        assert _SECRET_URL not in msg
+
+    def test_http_error_does_not_leak_url(self, monkeypatch):
+        import requests
+
+        from app import calendar_ics
+
+        monkeypatch.setattr(requests, "get", lambda url, **kw: _FakeResp(status_code=404))
+        with pytest.raises(calendar_ics.CalendarError) as ei:
+            calendar_ics.fetch_ics(_SECRET_URL)
+        assert "404" in str(ei.value)
+        assert "SECRETTOKEN123" not in str(ei.value)
+
+    def test_refresh_last_error_never_contains_url(self, monkeypatch):
+        import requests
+
+        cfg = AppConfig(ics_url=_SECRET_URL)
+        svc = CalendarService(cfg)
+
+        def _boom(url, **kw):
+            raise requests.exceptions.Timeout(f"timeout for {url}")
+
+        monkeypatch.setattr(requests, "get", _boom)
+        svc.refresh()
+        assert svc.last_error is not None
+        assert "SECRETTOKEN123" not in svc.last_error
+        assert _SECRET_URL not in svc.last_error
+
+
+class TestFetchIcsRedirects:
+    def test_redirect_is_rejected_not_followed(self, monkeypatch):
+        import requests
+
+        from app import calendar_ics
+
+        called = {}
+
+        def _get(url, **kw):
+            called.update(kw)
+            return _FakeResp(status_code=302, is_redirect=True)
+
+        monkeypatch.setattr(requests, "get", _get)
+        with pytest.raises(calendar_ics.CalendarError):
+            calendar_ics.fetch_ics(_SECRET_URL)
+        # M1: redirecty se zásadně nenásledují, TLS ověření zapnuté
+        assert called.get("allow_redirects") is False
+        assert called.get("verify") is True
+
+    def test_success_returns_text(self, monkeypatch):
+        import requests
+
+        from app import calendar_ics
+
+        monkeypatch.setattr(
+            requests,
+            "get",
+            lambda url, **kw: _FakeResp(status_code=200, text="BEGIN:VCALENDAR"),
+        )
+        assert calendar_ics.fetch_ics(_SECRET_URL) == "BEGIN:VCALENDAR"
+
+
+# ------------------------------------------- M3: vadná událost neshodí parse
+
+
+class TestParseRobustness:
+    def test_valid_events_parse_alongside_skippable_ones(self, ics_full):
+        # ics_full obsahuje i celodenní událost (přeskočí se) — ostatní validní
+        # se musí naparsovat, parse se kvůli „divné" události nezhroutí (M3).
+        meetings = parse_meetings(ics_full, window_days=7)
+        uids = {m.uid.split(":")[0] for m in meetings}
+        assert "single-meet-1@example.com" in uids
+        assert "weekly-teams-1@example.com" in uids
+        assert "allday-1@example.com" not in uids  # celodenní přeskočena
+
+    def test_malformed_calendar_does_not_crash_refresh(self, monkeypatch):
+        # Kalendář nečitelný i na úrovni parseru: refresh nesmí spadnout,
+        # ponechá poslední dobrý výsledek a nastaví bezpečnou chybu (M3 + C1).
+        cfg = AppConfig(ics_url="https://example.com/secret.ics")
+        svc = CalendarService(cfg)
+        monkeypatch.setattr(
+            "app.calendar_ics.fetch_ics", lambda url, timeout=15: "TOTO NENÍ ICS"
+        )
+        result = svc.refresh()
+        assert result == []  # žádná schůzka, ale bez pádu
+        assert svc.last_error is not None
+        assert "secret" not in svc.last_error
+
+    def test_dtend_before_dtstart_yields_positive_duration(self, now_local):
+        from datetime import timezone
+
+        def _z(dt):
+            return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+        start = now_local + timedelta(hours=1)
+        bad_end = start - timedelta(minutes=30)  # konec PŘED začátkem
+        ics = "\n".join(
+            [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                "PRODID:-//test//x//CS",
+                "BEGIN:VEVENT",
+                "UID:negdur-1@example.com",
+                f"DTSTART:{_z(start)}",
+                f"DTEND:{_z(bad_end)}",
+                "SUMMARY:Záporné trvání",
+                "DESCRIPTION:https://meet.google.com/aaa-bbbb-ccc",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ]
+        )
+        (m,) = parse_meetings(ics)
+        # Po našem guardu (a normalizaci knihovny) musí být trvání vždy kladné —
+        # ať se na to scheduler může spolehnout.
+        assert m.end > m.start
