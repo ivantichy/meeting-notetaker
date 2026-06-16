@@ -103,7 +103,16 @@ def main() -> int:
     recorder.on_finished.append(post_processor.enqueue)
 
     window = MainWindow(cfg, calendar_service, recorder, post_processor=post_processor)
-    window.show()
+    # Start na pozadí: aplikace žije v oznamovací oblasti (tray). Okno otevře
+    # uživatel dvojklikem na ikonu nebo přes „Zobrazit" v jejím menu.
+    from PySide6.QtWidgets import QSystemTrayIcon
+
+    window._tray.showMessage(
+        "Meeting Notetaker",
+        "Běží na pozadí. Dvojklikem na ikonu otevřete okno.",
+        QSystemTrayIcon.MessageIcon.Information,
+        4000,
+    )
     rc = app.exec()
     post_processor.stop(drain=False)
     return rc
