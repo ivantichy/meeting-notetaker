@@ -12,6 +12,7 @@ download_root='models')``. Pracovní vlákno konzumuje ``queue.Queue`` dvojic
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 from typing import TYPE_CHECKING, Callable
@@ -30,6 +31,69 @@ log = logging.getLogger(__name__)
 MAX_QUEUE_CHUNKS = 30
 #: Drain timeout při stop() — výrazně pod původních 120 s (H1).
 DRAIN_TIMEOUT_S = 30.0
+
+#: Krátké názvy modelů faster-whisper -> repo na HuggingFace. Stačí položky,
+#: které appka reálně používá (live_model/post_model); pro neznámý název
+#: padáme na heuristiku níž, takže tabulka nemusí být úplná (M9).
+_MODEL_REPOS = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "tiny.en": "Systran/faster-whisper-tiny.en",
+    "base": "Systran/faster-whisper-base",
+    "base.en": "Systran/faster-whisper-base.en",
+    "small": "Systran/faster-whisper-small",
+    "small.en": "Systran/faster-whisper-small.en",
+    "medium": "Systran/faster-whisper-medium",
+    "medium.en": "Systran/faster-whisper-medium.en",
+    "large-v1": "Systran/faster-whisper-large-v1",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "large": "Systran/faster-whisper-large-v3",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+}
+
+
+def model_is_downloaded(model_name: str, download_root: str = "models") -> bool:
+    """Heuristika (M9): je model ``model_name`` už stažený v ``download_root``?
+
+    Když ne, je jisté, že nejbližší stavění modelu spustí ~GB stahování a UI to
+    má ohlásit ("Stahuji model…"), aby appka nevypadala zamrzlá. Detekce je
+    schválně konzervativní: při jakékoli nejistotě vrací ``True`` (= nehlásit
+    stahování), aby se zbytečně neukazoval indikátor u modelu, který je ve
+    skutečnosti k dispozici.
+
+    Pravidla:
+    - lokální cesta (existující adresář / soubor) -> považujeme za stažený;
+    - jinak název přeložíme na repo ``org/jmeno`` (tabulka, jinak heuristika
+      Systran/faster-whisper-<jmeno>) a hledáme cache HuggingFace
+      ``download_root/models--<org>--<jmeno>/snapshots/*/`` s nějakým obsahem.
+    """
+    if not model_name:
+        return True  # bez modelu se nic nestahuje
+    # Uživatel může zadat přímo cestu k lokálnímu modelu — pak se nestahuje.
+    if os.path.isdir(model_name) or os.path.isfile(model_name):
+        return True
+
+    repo = _MODEL_REPOS.get(model_name, model_name)
+    if "/" in repo:
+        org, _, name = repo.partition("/")
+    else:
+        # Neznámý krátký název: faster-whisper publikuje pod Systran/.
+        org, name = "Systran", f"faster-whisper-{repo}"
+    cache_name = f"models--{org}--{name}"
+    snapshots = os.path.join(download_root, cache_name, "snapshots")
+    try:
+        if not os.path.isdir(snapshots):
+            return False
+        # Stažený model má aspoň jeden snapshot s obsahem (model.bin apod.).
+        for entry in os.listdir(snapshots):
+            snap = os.path.join(snapshots, entry)
+            if os.path.isdir(snap) and os.listdir(snap):
+                return True
+        return False
+    except OSError:
+        # Nejistota (chyba FS) -> konzervativně bez hlášení stahování.
+        return True
 
 
 class Transcriber:
@@ -54,6 +118,12 @@ class Transcriber:
         self._thread: threading.Thread | None = None
         self._model = None
         self._dropped = 0
+        #: Stav stavění modelu pro UI (M9): "" | "downloading" | "loading" |
+        #: "ready". Čte se z UI vlákna (jen čtení str atributu je bezpečné).
+        self.model_status: str = ""
+        #: Voláno při změně model_status (např. "downloading"). UI to musí
+        #: marshalovat do svého vlákna stejně jako ostatní callbacky (L6).
+        self.on_model_status: "Callable[[str], None]" = lambda state: None
 
     # ------------------------------------------------------------------ API
 
@@ -119,14 +189,30 @@ class Transcriber:
 
     # --------------------------------------------------------------- worker
 
+    def _set_model_status(self, state: str) -> None:
+        """Nastaví stav stavění modelu a probublá ho do UI (M9)."""
+        if state == self.model_status:
+            return
+        self.model_status = state
+        try:
+            self.on_model_status(state)
+        except Exception:  # noqa: BLE001 - callback UI nesmí shodit přepis
+            log.exception("Callback on_model_status selhal.")
+
     def _get_model(self):
         if self._model is None:
             if self._model_factory is not None:
+                # Testovací/injektovaný model — stav nastavíme bez detekce FS.
+                self._set_model_status("loading")
                 self._model = self._model_factory()
+                self._set_model_status("ready")
                 return self._model
             from faster_whisper import WhisperModel  # líný import
 
-            import os
+            # M9: když model ještě není v models/, nejbližší build spustí
+            # ~GB stahování — ohlásíme to UI předem, ať nevypadá zamrzlé.
+            downloaded = model_is_downloaded(self._cfg.live_model, "models")
+            self._set_model_status("loading" if downloaded else "downloading")
 
             # Omezíme počet CPU vláken Whisperu, aby zachytávací vlákna
             # (WASAPI) nehladověla a nevznikaly výpadky "data discontinuity".
@@ -139,6 +225,7 @@ class Transcriber:
                 cpu_threads=cpu_threads,
                 num_workers=1,
             )
+            self._set_model_status("ready")
         return self._model
 
     def _worker(self) -> None:

@@ -400,14 +400,37 @@ class MainWindow(QMainWindow):
                 log.exception("Start detekovaného záznamu selhal")
                 self._detector_cooldown_until = _time.monotonic() + 120
 
+    def _model_download_message(self) -> str:
+        """Hláška o jednorázovém stahování Whisper modelu (M9), nebo "".
+
+        Při prvním spuštění stáhne faster-whisper model (~2 GB u finálního),
+        což trvá minuty — bez indikátoru by appka vypadala zamrzlá. Stav čteme
+        z post-processoru (běží v daemon vlákně, takže UI mezitím repaintuje)
+        i z živého přepisu (transcriber), pokud zrovna existuje. Finální model
+        má přednost (je výrazně větší). Stav je jen str atribut — čtení napříč
+        vlákny je bezpečné (widgety zde nikdo z worker vlákna nesahá)."""
+        pp = self._post_processor
+        if pp is not None and getattr(pp, "model_status", "") == "downloading":
+            return "⏳ Stahuji model přepisu… (jednorázově, ~2 GB)"
+        # Živý model staví recorder ve svém transcriberu; čteme ho best-effort.
+        live = getattr(self._recorder, "_transcriber", None)
+        if live is not None and getattr(live, "model_status", "") == "downloading":
+            return "⏳ Stahuji model živého přepisu… (jednorázově)"
+        return ""
+
     def _update_post_status(self) -> None:
-        """Indikátor dopřepisování WAV: text ve stavové liště + oranžová
-        tray ikona (pokud zrovna nenahráváme — červená má přednost)."""
+        """Indikátor dopřepisování WAV + stahování modelu: text ve stavové
+        liště + oranžová tray ikona (pokud zrovna nenahráváme — červená má
+        přednost)."""
         pp = self._post_processor
         if pp is None:
             return
+        downloading = self._model_download_message()
         busy = pp.busy
-        if busy:
+        if downloading:
+            # Stahování modelu má přednost před hláškou o dopřepisu (M9).
+            self._post_label.setText(downloading)
+        elif busy:
             current = pp.current
             waiting = pp.pending
             text = f"⏳ Dopřepisuji: {current or '…'}"
@@ -423,10 +446,15 @@ class MainWindow(QMainWindow):
         )
         if recording:
             return  # červenou ikonu řídí _on_state_changed
-        if busy:
+        if busy or downloading:
             self._tray.setIcon(self._icon_postprocessing)
             self.setWindowIcon(self._icon_postprocessing)
-            self._tray.setToolTip("Meeting Notetaker — dopřepisuji záznam")
+            tip = (
+                "Meeting Notetaker — stahuji model"
+                if downloading
+                else "Meeting Notetaker — dopřepisuji záznam"
+            )
+            self._tray.setToolTip(tip)
         else:
             self._tray.setIcon(self._icon_idle)
             self.setWindowIcon(self._icon_idle)

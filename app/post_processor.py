@@ -122,6 +122,10 @@ class PostProcessor:
         self._drain = False
         self._thread: "threading.Thread | None" = None
         self._current: str | None = None  # poznámka právě v dopřepisu
+        #: Stav stavění finálního modelu pro UI (M9): "" | "downloading" |
+        #: "loading" | "ready". Nastavuje worker vlákno při prvním úkolu,
+        #: čte UI vlákno přes _update_post_status (čtení str atributu je OK).
+        self.model_status: str = ""
 
     def start(self) -> None:
         """Spustí worker vlákno (idempotentní)."""
@@ -236,7 +240,20 @@ class PostProcessor:
         channels, framerate, duration_s = _load_wav_f32(wav_path)
         mono = np.clip(channels.mean(axis=1), -1.0, 1.0).astype(np.float32)
         if self._transcribe is None:
-            self._transcribe = self._transcribe_factory()
+            # M9: první úkol staví finální model. Když ještě není v models/,
+            # spustí ~GB stahování (~2 GB u large-v3-turbo) — ohlásíme to UI
+            # přes model_status, ať appka nevypadá zamrzlá. Vlastní stavění
+            # běží tady, v daemon vlákně, takže UI mezitím repaintuje.
+            from app.transcriber import model_is_downloaded
+
+            if model_is_downloaded(self.cfg.post_model, "models"):
+                self.model_status = "loading"
+            else:
+                self.model_status = "downloading"
+            try:
+                self._transcribe = self._transcribe_factory()
+            finally:
+                self.model_status = "ready"
         segments = self._transcribe(mono)
         labeled = _attribute_speakers(channels, framerate, segments)
         replaced = self.note_store.replace_transcript(note_path, labeled)

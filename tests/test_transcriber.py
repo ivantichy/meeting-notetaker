@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from app.config import AppConfig
-from app.transcriber import MAX_QUEUE_CHUNKS, Transcriber
+from app.transcriber import MAX_QUEUE_CHUNKS, Transcriber, model_is_downloaded
 
 
 def _wait_until(cond, timeout: float = 5.0, interval: float = 0.01) -> bool:
@@ -128,3 +128,108 @@ def test_queue_is_bounded_drops_oldest(cfg):
     for i in range(MAX_QUEUE_CHUNKS + 50):
         tr.submit(np.zeros(10, dtype=np.float32), float(i))
     assert tr.queue_depth <= MAX_QUEUE_CHUNKS
+
+
+# --------------------------------------------------------------- M9: detekce
+# stahování modelu (indikátor "Stahuji model…" v UI).
+
+
+def _make_snapshot(root, cache_name: str) -> None:
+    """Vytvoří v ``root`` realistický HuggingFace cache snapshot s obsahem."""
+    snap = root / cache_name / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    (snap / "model.bin").write_bytes(b"\x00")
+    (snap / "config.json").write_text("{}", encoding="utf-8")
+
+
+def test_model_is_downloaded_false_when_absent(tmp_path):
+    """Prázdný download_root -> model není stažený (UI má hlásit stahování)."""
+    assert model_is_downloaded("small", str(tmp_path)) is False
+
+
+def test_model_is_downloaded_true_when_snapshot_present(tmp_path):
+    """Existující snapshot s obsahem -> model je k dispozici (žádné stahování)."""
+    # "small" -> Systran/faster-whisper-small -> models--Systran--faster-whisper-small
+    _make_snapshot(tmp_path, "models--Systran--faster-whisper-small")
+    assert model_is_downloaded("small", str(tmp_path)) is True
+
+
+def test_model_is_downloaded_post_model_repo_mapping(tmp_path):
+    """large-v3-turbo se mapuje na mobiuslabsgmbh repo (jiná org než Systran)."""
+    _make_snapshot(
+        tmp_path, "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo"
+    )
+    assert model_is_downloaded("large-v3-turbo", str(tmp_path)) is True
+    # jiný model ve stejném rootu chybí -> stahování
+    assert model_is_downloaded("small", str(tmp_path)) is False
+
+
+def test_model_is_downloaded_empty_snapshot_counts_as_absent(tmp_path):
+    """Snapshot adresář bez souborů (nedokončené stažení) -> není hotovo."""
+    (tmp_path / "models--Systran--faster-whisper-small" / "snapshots").mkdir(
+        parents=True
+    )
+    assert model_is_downloaded("small", str(tmp_path)) is False
+
+
+def test_model_is_downloaded_local_path_is_present(tmp_path):
+    """Lokální cesta k modelu (adresář) -> nestahuje se."""
+    assert model_is_downloaded(str(tmp_path)) is True
+
+
+def test_model_is_downloaded_empty_name_is_present():
+    """Prázdný název (vypnutý model) -> nic se nestahuje."""
+    assert model_is_downloaded("") is True
+
+
+def test_transcriber_reports_downloading_when_model_absent(cfg, monkeypatch):
+    """M9: když model ještě není stažený, transcriber projde stavem
+    'downloading' a po načtení skončí na 'ready'. faster_whisper je v testech
+    mock (conftest), takže reálné stažení neproběhne — řídíme jen detekci."""
+    import app.transcriber as tmod
+
+    # Vynutíme "není stažený" bez závislosti na FS/CWD.
+    monkeypatch.setattr(tmod, "model_is_downloaded", lambda name, root: False)
+
+    states: list[str] = []
+    # Reálná build cesta (model_factory=None) -> WhisperModel z mocku.
+    tr = Transcriber(
+        cfg,
+        on_segments=lambda segs: None,
+        model_factory=None,
+    )
+    tr.on_model_status = states.append
+    assert tr.model_status == ""
+
+    tr._get_model()  # přímo build cesta (jinak by ji spustil start())
+
+    assert states[0] == "downloading"  # ohlášeno PŘED stavěním modelu
+    assert tr.model_status == "ready"
+    assert states[-1] == "ready"
+
+
+def test_transcriber_reports_loading_when_model_present(cfg, monkeypatch):
+    """Když je model už stažený, hlásí se 'loading' (ne 'downloading')."""
+    import app.transcriber as tmod
+
+    monkeypatch.setattr(tmod, "model_is_downloaded", lambda name, root: True)
+    states: list[str] = []
+    tr = Transcriber(cfg, on_segments=lambda segs: None, model_factory=None)
+    tr.on_model_status = states.append
+    tr._get_model()
+    assert "downloading" not in states
+    assert states[0] == "loading"
+    assert tr.model_status == "ready"
+
+
+def test_transcriber_model_status_lifecycle_with_injected_factory(cfg):
+    """Injektovaný model (testy) -> loading -> ready, bez detekce FS."""
+    states: list[str] = []
+    tr = Transcriber(
+        cfg, on_segments=lambda segs: None, model_factory=FakeModel
+    )
+    tr.on_model_status = states.append
+    tr.start()
+    tr.stop()
+    assert states == ["loading", "ready"]
+    assert tr.model_status == "ready"

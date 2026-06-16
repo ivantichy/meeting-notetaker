@@ -71,12 +71,44 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; \
     WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Remove logs and runtime files created next to the exe at run time so the
-; install directory is left clean. User data (notes\, models\, config.json) is
-; intentionally left in place; see the comment block below.
-Type: files; Name: "{app}\notetaker.log"
+; Tidy up the install directory after the standard uninstaller has removed the
+; recorded app files. User data created next to the exe at run time
+; (notes\, models\, config.json, notetaker.log) is NOT listed here: by default
+; it is kept, and it is only removed when the user explicitly opts in via the
+; confirmation prompt in the [Code] section below (CurUninstallStepChanged).
 Type: dirifempty; Name: "{app}"
 
-; NOTE: notes\, models\ and config.json are created next to the exe while the
-; app runs. They are deliberately NOT auto-deleted on uninstall so the user
-; keeps their transcripts, downloaded Whisper models and (secret) ICS URL.
+; NOTE: notes\, models\, config.json and notetaker.log are created next to the
+; exe while the app runs. They are deliberately NOT auto-deleted on uninstall:
+; the uninstaller asks the user first and defaults to keeping them, so the user
+; keeps their transcripts, downloaded Whisper models and (secret) ICS URL
+; unless they explicitly choose otherwise.
+
+[Code]
+{ On uninstall, ask whether the user also wants to delete their personal data
+  (recordings/transcripts in notes\, downloaded Whisper models\, config.json
+  and notetaker.log) that lives next to the installed exe. The default answer
+  is "No" (keep the data); deletion only happens on an explicit "Yes". The
+  standard uninstaller still removes all normal program files regardless. }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Response: Integer;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    Response := MsgBox(
+      'Smazat i vaše nahrávky, přepisy a nastavení (složky notes a models, '
+        + 'config.json a notetaker.log)?' + #13#10 + #13#10
+        + 'Pokud zvolíte Ne, zůstanou na disku.',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
+    if Response = IDYES then
+    begin
+      { Folders: notes\ (transcripts + index) and models\ (downloaded models). }
+      DelTree(ExpandConstant('{app}\notes'), True, True, True);
+      DelTree(ExpandConstant('{app}\models'), True, True, True);
+      { Individual files: config and runtime log. }
+      DeleteFile(ExpandConstant('{app}\config.json'));
+      DeleteFile(ExpandConstant('{app}\notetaker.log'));
+    end;
+  end;
+end;
