@@ -15,6 +15,51 @@ import wave
 
 log = logging.getLogger(__name__)
 
+#: Mezní mezera (s) pro slučování sousedních segmentů STEJNÉHO mluvčího.
+#: Whisper u váhavé řeči vysype 1-3 slova na řádek; sousední úryvky téhož
+#: mluvčího do sebe slijeme, když je mezi nimi mezera < MERGE_GAP_S. Drženo
+#: nízko (1.2 s), ať neslepíme dvě samostatné výpovědi.
+MERGE_GAP_S = 1.2
+
+
+def _norm_text(text: str) -> str:
+    """Normalizace pro porovnání duplicit: lowercase + sjednocení mezer."""
+    return " ".join((text or "").split()).casefold()
+
+
+def _merge_segments(segments: "list") -> "list":
+    """Sloučí roztříštěné segmenty a zahodí doslovné duplicitní sousedy.
+
+    Vstup i výstup jsou 4-tice ``(t0, t1, text, speaker)`` (jako z
+    ``_attribute_speakers``). Pravidla (čistá funkce, snadno testovatelná):
+
+    - Sousední segmenty STEJNÉHO mluvčího se slijí do jednoho, když je mezera
+      ``next.start - prev.end < MERGE_GAP_S``: text spojen jednou mezerou,
+      ``start`` = první, ``end`` = poslední. Přes různé mluvčí se neslučuje.
+    - Segment, jehož text se (case- a whitespace-insensitivně) shoduje s
+      textem bezprostředně předcházejícího PONECHANÉHO segmentu, se zahodí
+      (doslovně zopakovaný soused, např. 3x "A to ještě jako…").
+    """
+    out: list = []
+    for seg in segments:
+        t0, t1, text = seg[0], seg[1], seg[2]
+        speaker = seg[3] if len(seg) > 3 else None
+        if out:
+            p0, p1, ptext, pspeaker = out[-1]
+            # Doslovný duplicitní soused -> zahodit (nezáleží na mluvčím).
+            if _norm_text(text) == _norm_text(ptext):
+                # Posuneme konec, ať se nezahodí časový rozsah opakování.
+                if t1 > p1:
+                    out[-1] = (p0, t1, ptext, pspeaker)
+                continue
+            # Stejný mluvčí + malá mezera -> slij do předchozího.
+            if speaker == pspeaker and (t0 - p1) < MERGE_GAP_S:
+                joined = f"{ptext.strip()} {text.strip()}".strip()
+                out[-1] = (p0, max(p1, t1), joined, pspeaker)
+                continue
+        out.append((t0, t1, text, speaker))
+    return out
+
 
 def _load_wav_f32(path: str) -> "tuple":
     """Načte WAV jako float32 [-1, 1]; vrací (channels, framerate, délka_s).
@@ -66,9 +111,15 @@ def _attribute_speakers(channels, framerate: int, segments: "list") -> "list":
     return out
 
 
-def _build_default_transcribe(cfg):
-    """Vytvoří přepisovací funkci nad faster-whisper modelem cfg.post_model."""
+def _build_default_transcribe(cfg, attendees=None):
+    """Vytvoří přepisovací funkci nad faster-whisper modelem cfg.post_model.
+
+    ``attendees`` (jména z frontmatteru poznámky) se doplní do initial_prompt
+    slovníku, ať model trefí jména účastníků (kvalita přepisu).
+    """
     from faster_whisper import WhisperModel  # líný import — na Linuxu/testech mock
+
+    from app.glossary import build_initial_prompt
 
     model = WhisperModel(
         cfg.post_model,
@@ -78,18 +129,22 @@ def _build_default_transcribe(cfg):
         cpu_threads=max(2, (os.cpu_count() or 8) // 2),
         num_workers=1,
     )
+    prompt = build_initial_prompt(attendees)
 
     def _transcribe(audio):
-        # "auto" / "" -> autodetekce jazyka (z prvních ~30 s nahrávky)
+        # Jazyk detekujeme JEDNOU (multilingual=False): konkrétní kód z configu
+        # předáme natvrdo, "auto"/"" -> language=None (faster-whisper detekuje
+        # z ~prvních 30 s a dál ho nepřepíná po segmentech).
         lang = cfg.language if cfg.language not in ("", "auto") else None
         segments, _info = model.transcribe(
             audio,
             language=lang,
-            multilingual=lang is None,  # střídání jazyků uvnitř jednoho meetingu
+            multilingual=False,  # jeden jazyk pro celé audio (žádná re-detekce)
             vad_filter=True,
+            vad_parameters=dict(min_speech_duration_ms=250, max_speech_duration_s=30),
             beam_size=2,
             condition_on_previous_text=True,
-            initial_prompt="Přepis českého pracovního meetingu." if lang == "cs" else None,
+            initial_prompt=prompt,  # slovník jmen/termínů pro JAKÝKOLI jazyk
         )
         return [
             (s.start, s.end, s.text.strip()) for s in segments if s.text.strip()
@@ -113,7 +168,7 @@ class PostProcessor:
         self.cfg = cfg
         self.note_store = note_store
         self._transcribe_factory = transcribe_factory or (
-            lambda: _build_default_transcribe(cfg)
+            lambda attendees=None: _build_default_transcribe(cfg, attendees)
         )
         self._on_event = on_event or (lambda event, detail: None)
         self._transcribe = None  # vytvoří se při prvním úkolu, drží se dál
@@ -160,6 +215,21 @@ class PostProcessor:
             self._discard_wav(wav_path)
             return
         self._queue.put((note_path, wav_path))
+
+    @staticmethod
+    def _read_attendees(note_path: str) -> "list[str]":
+        """Přečte ``attendees`` z YAML frontmatteru poznámky (pro initial_prompt
+        slovník). Chyba/chybějící klíč -> prázdný seznam (přepis nesmí spadnout).
+        """
+        from app.storage import _parse_frontmatter
+
+        try:
+            with open(note_path, "r", encoding="utf-8") as f:
+                meta = _parse_frontmatter(f.read())
+        except OSError:
+            return []
+        att = meta.get("attendees")
+        return [str(a) for a in att] if isinstance(att, list) else []
 
     @staticmethod
     def _discard_wav(wav_path: str) -> None:
@@ -239,6 +309,7 @@ class PostProcessor:
 
         channels, framerate, duration_s = _load_wav_f32(wav_path)
         mono = np.clip(channels.mean(axis=1), -1.0, 1.0).astype(np.float32)
+        attendees = self._read_attendees(note_path)
         if self._transcribe is None:
             # M9: první úkol staví finální model. Když ještě není v models/,
             # spustí ~GB stahování (~2 GB u large-v3-turbo) — ohlásíme to UI
@@ -251,11 +322,19 @@ class PostProcessor:
             else:
                 self.model_status = "downloading"
             try:
-                self._transcribe = self._transcribe_factory()
+                # Účastníky (z frontmatteru) předáme do initial_prompt slovníku.
+                # Fake factories v testech berou 0 argumentů -> fallback (L6).
+                try:
+                    self._transcribe = self._transcribe_factory(attendees=attendees)
+                except TypeError:
+                    self._transcribe = self._transcribe_factory()
             finally:
                 self.model_status = "ready"
         segments = self._transcribe(mono)
         labeled = _attribute_speakers(channels, framerate, segments)
+        # Slij roztříštěné segmenty téhož mluvčího a zahoď doslovné duplicity
+        # (Whisper u váhavé řeči sype 1-3 slova na řádek a občas řádek zopakuje).
+        labeled = _merge_segments(labeled)
         replaced = self.note_store.replace_transcript(note_path, labeled)
 
         if not replaced:

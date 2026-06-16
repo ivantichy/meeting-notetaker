@@ -30,10 +30,10 @@ def _default_capture_factory(cfg, on_chunk):
     return AudioCapture(cfg, on_chunk)
 
 
-def _default_transcriber_factory(cfg, on_segments):
+def _default_transcriber_factory(cfg, on_segments, attendees=None):
     from app.transcriber import Transcriber
 
-    return Transcriber(cfg, on_segments)
+    return Transcriber(cfg, on_segments, attendees=attendees)
 
 
 class Recorder:
@@ -109,7 +109,15 @@ class Recorder:
                 )
 
             path = self._store.create_note(meeting)
-            transcriber = self._transcriber_factory(self._cfg, self._handle_segments)
+            # Účastníky meetingu předáme transcriberu pro initial_prompt slovník
+            # (lepší přepis jmen). Fake factories v testech berou jen 2 argumenty
+            # — pak attendees vynecháme (zpětná kompatibilita).
+            try:
+                transcriber = self._transcriber_factory(
+                    self._cfg, self._handle_segments, attendees=meeting.attendees
+                )
+            except TypeError:
+                transcriber = self._transcriber_factory(self._cfg, self._handle_segments)
             capture = self._capture_factory(self._cfg, self._handle_chunk)
             # Probublání výpadku zařízení uprostřed hovoru (H5), pokud to
             # capture umí (AudioCapture ano; fake objekty v testech nemusí).

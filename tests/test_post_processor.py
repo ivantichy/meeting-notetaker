@@ -3,6 +3,7 @@ import os
 import time
 import wave
 from datetime import timedelta
+from unittest import mock
 
 import pytest
 
@@ -59,9 +60,10 @@ def test_happy_path_replaces_transcript_and_deletes_wav(
         store, make_meeting, fixed_now, "Týmová porada"
     )
     events = []
+    # Mezera 1.5 s (>= MERGE_GAP_S) -> _merge_segments je nechá jako 2 řádky.
     fixed_segments = [
         (0.0, 2.5, "Kvalitní první věta."),
-        (3.0, 6.0, "Kvalitní druhá věta."),
+        (4.0, 6.0, "Kvalitní druhá věta."),
     ]
     pp = PostProcessor(
         cfg,
@@ -78,7 +80,7 @@ def test_happy_path_replaces_transcript_and_deletes_wav(
     text = _read(note_path)
     # nové řádky v sekci Přepis, staré pryč
     assert "[00:00:00] Kvalitní první věta." in text
-    assert "[00:00:03] Kvalitní druhá věta." in text
+    assert "[00:00:04] Kvalitní druhá věta." in text
     assert "Živý nekvalitní přepis." not in text
     assert text.index("## Přepis") < text.index("[00:00:00] Kvalitní první věta.")
     # frontmatter má transcript_quality: final
@@ -209,3 +211,126 @@ def test_speaker_attribution_mono_returns_none():
     channels = np.zeros((16000, 1), dtype=np.float32)
     labeled = _attribute_speakers(channels, 16000, [(0.0, 0.5, "x")])
     assert labeled[0][3] is None
+
+
+# --------------------------------------------------------- _merge_segments
+
+
+def test_merge_same_speaker_small_gap_joins():
+    """Sousední segmenty téhož mluvčího s malou mezerou se slijí do jednoho."""
+    from app.post_processor import _merge_segments
+
+    segs = [
+        (0.0, 1.0, "A to", "Ivan"),
+        (1.5, 2.0, "ještě jako", "Ivan"),  # mezera 0.5 s < 1.2 s
+    ]
+    out = _merge_segments(segs)
+    assert len(out) == 1
+    assert out[0] == (0.0, 2.0, "A to ještě jako", "Ivan")
+
+
+def test_merge_verbatim_duplicate_neighbor_dropped():
+    """Doslovně zopakovaný soused (case/whitespace-insensitivně) se zahodí."""
+    from app.post_processor import _merge_segments
+
+    segs = [
+        (0.0, 1.0, "A to ještě jako...", "Ivan"),
+        (3.0, 4.0, "  a to JEŠTĚ jako...  ", "Ivan"),  # velká mezera, ale duplicita
+        (6.0, 7.0, "Jiná věta.", "Ivan"),  # > MERGE_GAP_S za duplicitou -> samostatně
+    ]
+    out = _merge_segments(segs)
+    texts = [s[2] for s in out]
+    assert texts == ["A to ještě jako...", "Jiná věta."]
+    # rozsah duplicitního opakování se promítne do end prvního segmentu
+    assert out[0][1] == 4.0
+
+
+def test_merge_different_speakers_not_merged():
+    """Přes různé mluvčí se neslučuje ani při malé mezeře."""
+    from app.post_processor import _merge_segments
+
+    segs = [
+        (0.0, 1.0, "Ahoj.", "Ivan"),
+        (1.2, 2.0, "Ahoj zpět.", "Ostatní"),  # mezera 0.2 s, ale jiný mluvčí
+    ]
+    out = _merge_segments(segs)
+    assert len(out) == 2
+    assert out[0][3] == "Ivan"
+    assert out[1][3] == "Ostatní"
+
+
+def test_merge_gap_at_or_above_threshold_not_merged():
+    """Mezera >= MERGE_GAP_S se neslučuje (zůstávají samostatné segmenty)."""
+    from app.post_processor import MERGE_GAP_S, _merge_segments
+
+    segs = [
+        (0.0, 1.0, "První.", "Ivan"),
+        (1.0 + MERGE_GAP_S, 2.0 + MERGE_GAP_S, "Druhá.", "Ivan"),
+    ]
+    out = _merge_segments(segs)
+    assert len(out) == 2
+
+
+def test_merge_preserves_unrelated_sequence():
+    """Smysluplná posloupnost (různé texty, větší mezery) zůstane beze změny."""
+    from app.post_processor import _merge_segments
+
+    segs = [
+        (0.0, 2.0, "Věta jedna.", "Ivan"),
+        (5.0, 7.0, "Věta dvě.", "Ostatní"),
+        (10.0, 12.0, "Věta tři.", "Ivan"),
+    ]
+    out = _merge_segments(segs)
+    assert out == segs
+
+
+# --------------------------------------------------- build_initial_prompt
+
+
+def test_initial_prompt_includes_glossary_terms_and_attendees():
+    """Prompt obsahuje známé termíny i jména účastníků (email -> lokální část)."""
+    from app.glossary import build_initial_prompt
+
+    prompt = build_initial_prompt(["ivan@example.com", "Petr Novák"])
+    assert "Claude" in prompt
+    assert "elem6" in prompt
+    assert "ivan" in prompt          # z e-mailu jen lokální část
+    assert "Petr Novák" in prompt
+
+
+def test_initial_prompt_deduplicates_case_insensitively():
+    """Duplicitní položky (i přes velikost písmen) se v promptu neopakují."""
+    from app.glossary import build_initial_prompt
+
+    prompt = build_initial_prompt(["Claude", "claude", "ivan@x.cz", "ivan@y.cz"])
+    assert prompt.lower().count("claude") == 1
+    assert prompt.count("ivan") == 1
+
+
+def test_default_transcribe_passes_multilingual_false_and_prompt():
+    """_build_default_transcribe volá model.transcribe s multilingual=False,
+    vad_parameters a initial_prompt obsahujícím slovník (Claude)."""
+    from unittest.mock import MagicMock
+
+    import faster_whisper
+
+    import app.post_processor as pp
+
+    fake_model = MagicMock()
+    fake_model.transcribe.return_value = ([], object())
+    cfg = AppConfig(post_model="large-v3-turbo", language="auto")
+
+    # _build_default_transcribe dělá `from faster_whisper import WhisperModel`
+    # (conftest má faster_whisper jako MagicMock v sys.modules) — patchneme tedy
+    # atribut WhisperModel, ať vrátí náš fake model.
+    with mock.patch.object(faster_whisper, "WhisperModel", return_value=fake_model):
+        transcribe = pp._build_default_transcribe(cfg, attendees=["Petr"])
+    transcribe(object())
+
+    _, kwargs = fake_model.transcribe.call_args
+    assert kwargs["multilingual"] is False
+    assert kwargs["language"] is None  # "auto" -> detekce jednou
+    assert "Claude" in kwargs["initial_prompt"]
+    assert "Petr" in kwargs["initial_prompt"]
+    assert kwargs["vad_parameters"]["min_speech_duration_ms"] == 250
+    assert kwargs["vad_parameters"]["max_speech_duration_s"] == 30

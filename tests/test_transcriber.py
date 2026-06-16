@@ -64,6 +64,36 @@ def test_processes_chunk_applies_offset(cfg):
     assert t1 == pytest.approx(21.0)
 
 
+def test_live_transcribe_uses_multilingual_false_and_prompt_with_attendees(cfg):
+    """Živý přepis volá model.transcribe s multilingual=False a initial_prompt,
+    který obsahuje slovník (Claude) i jména účastníků předaná transcriberu."""
+    captured = {}
+
+    class CapturingModel(FakeModel):
+        def transcribe(self, audio, **kw):
+            captured.update(kw)
+            return super().transcribe(audio, **kw)
+
+    tr = Transcriber(
+        cfg,
+        on_segments=lambda segs: None,
+        model_factory=CapturingModel,
+        attendees=["Petr Novák", "ivan@example.com"],
+    )
+    tr.start()
+    tr.submit(np.zeros(1600, dtype=np.float32), 0.0)
+    assert _wait_until(lambda: "multilingual" in captured)
+    tr.stop()
+
+    assert captured["multilingual"] is False
+    assert captured["language"] == "cs"  # konkrétní kód z configu
+    assert "Claude" in captured["initial_prompt"]
+    assert "Petr Novák" in captured["initial_prompt"]
+    assert "ivan" in captured["initial_prompt"]  # e-mail -> lokální část
+    assert captured["vad_parameters"]["min_speech_duration_ms"] == 250
+    assert captured["vad_parameters"]["max_speech_duration_s"] == 30
+
+
 def test_stop_drains_remaining_queue(cfg):
     out = []
     # pomalý model, ať se ve frontě stihne nahromadit víc bloků

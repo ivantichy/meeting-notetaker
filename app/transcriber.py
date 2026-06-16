@@ -105,9 +105,14 @@ class Transcriber:
         on_segments: Callable[[list[tuple[float, float, str]]], None],
         on_error: "Callable[[str], None] | None" = None,
         model_factory: "Callable[[], object] | None" = None,
+        attendees: "list[str] | None" = None,
     ):
         self._cfg = cfg
         self._on_segments = on_segments
+        #: Jména/e-maily účastníků meetingu — doplní se do initial_prompt
+        #: slovníku, ať Whisper trefí jejich jména (kvalita přepisu). Prázdné
+        #: u ručního záznamu nebo když je Recorder nepředá.
+        self._attendees = list(attendees or [])
         #: Voláno (z vlákna start()) při neúspěšném načtení modelu — UI to má
         #: tvrdě ohlásit místo nekonečného opakování po blocích (H1).
         self._on_error = on_error or (lambda msg: None)
@@ -245,18 +250,25 @@ class Transcriber:
                 self._queue.task_done()
 
     def _process(self, samples: "np.ndarray", offset_s: float) -> None:
+        from app.glossary import build_initial_prompt
+
         model = self._get_model()
-        # "auto" / "" -> autodetekce jazyka (každý blok zvlášť — zvládne
-        # i střídání češtiny a angličtiny mezi meetingy či v rámci jednoho).
+        # Jazyk detekujeme JEDNOU (multilingual=False): konkrétní kód z configu
+        # předáme natvrdo, "auto"/"" -> language=None (faster-whisper detekuje
+        # z bloku a dál ho nepřepíná po segmentech — to dřív tříštilo segmenty
+        # i kazilo přesnost).
         lang = self._cfg.language if self._cfg.language not in ("", "auto") else None
+        # initial_prompt (slovník jmen/termínů) dáváme pro JAKÝKOLI jazyk —
+        # zlepší přepis názvů (elem6, Claude, …) i účastníků meetingu.
         segments, _info = model.transcribe(
             samples,
             language=lang,
-            multilingual=lang is None,  # střídání jazyků i uvnitř 20s bloku
+            multilingual=False,  # jeden jazyk pro celý blok (žádná re-detekce)
             vad_filter=True,
+            vad_parameters=dict(min_speech_duration_ms=250, max_speech_duration_s=30),
             beam_size=1,
             condition_on_previous_text=False,
-            initial_prompt="Přepis českého pracovního meetingu." if lang == "cs" else None,
+            initial_prompt=build_initial_prompt(self._attendees),
         )
         out: list[tuple[float, float, str]] = []
         for seg in segments:
