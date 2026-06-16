@@ -296,10 +296,13 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
 
 ## Failure handling
 
-- ICS fetch fails -> keep the last good list, show the error in the status bar.
-- soundcard device missing -> recorder error state, message shown in the CallPanel.
-- Whisper model download (first run) -> status shown in the CallPanel ("Stahuji
-  model…"), capture buffers to the queue meanwhile.
+- ICS fetch fails -> keep the last good list, show a sanitized error in the status bar
+  (the secret calendar URL is never written to the log or the UI).
+- Audio device missing or lost mid-call -> capture raises a device error that stops the
+  recording and shows a rate-limited message.
+- Whisper model download (first run, ~2 GB from Hugging Face) -> happens lazily on first
+  use; there is no progress indicator yet (planned). The live queue is bounded (drops the
+  oldest chunk under back-pressure) and a model-load failure is reported, not swallowed.
 - App restart mid-meeting -> the scheduler sees the in-progress meeting -> start() ->
   NoteStore appends a continuation marker. Unfinished re-transcriptions are picked up
   by the post-processor's orphan scan on the next start.
@@ -309,16 +312,10 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
 ## requirements.txt
 
 ```
-PySide6
-faster-whisper
-soundcard
-numpy
-requests
-icalendar
-recurring-ical-events
-python-dateutil
-tzdata
-pytest        # dev
+# Runtime deps are version-pinned in requirements.txt, with a full requirements.lock
+# (pip freeze). Dev/build tools (pytest, pyinstaller) live in requirements-dev.txt.
+PySide6  faster-whisper  soundcard  numpy  av
+requests  icalendar  recurring-ical-events  python-dateutil  tzdata
 ```
 
 ## Tests (pytest — run on Linux, with no audio/Whisper imports)
@@ -326,7 +323,7 @@ pytest        # dev
 `conftest.py` injects `sys.modules['soundcard'] = MagicMock()` (and the same for
 `faster_whisper`) before the app is imported, and provides fixtures: sample ICS text
 (single + recurring + Meet + Teams + an all-day event to ignore), a temp notes dir,
-and a freeze-time helper. The suite has 87 tests:
+and a freeze-time helper. The suite has 147 tests:
 
 - `test_calendar`: parse single/recurring events, platform & URL detection, window
   filtering, sort order, time zones.
@@ -341,6 +338,12 @@ and a freeze-time helper. The suite has 87 tests:
 - `test_post_processor`: happy path replaces the transcript and deletes the WAV, a
   transcription error keeps the WAV and the worker survives, orphan scan, and stereo
   vs. mono speaker attribution.
+- `test_audio_capture`: resampling, mono mixing, mic/loopback channel pairing and order,
+  clipping, and emit offsets.
+- `test_transcriber`: bounded queue drops oldest, drain on stop, model-load failure is
+  raised, and one bad chunk does not kill the worker.
+- `test_config`: round-trip, corrupt-file backup that preserves `ics_url`, and the
+  example file matching the code defaults.
 
 Run them with:
 
