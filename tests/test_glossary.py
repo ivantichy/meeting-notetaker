@@ -12,9 +12,12 @@ from app.glossary import (
     GLOSSARY_TERMS,
     MAX_ATTENDEES,
     MAX_TOPIC_TERMS,
+    add_glossary_terms,
     build_initial_prompt,
     ensure_glossary_file,
     extract_topic_terms,
+    read_glossary_terms,
+    remove_glossary_terms,
 )
 
 
@@ -308,3 +311,114 @@ def test_no_topic_terms_behaves_as_before(tmp_path):
     assert "Kontext:" not in prompt
     assert "Kubernetes" in prompt
     assert "Petr" in prompt
+
+
+# ----------------------------- read/add/remove glossary helpers (path-based)
+
+
+class TestGlossaryReadAddRemove:
+    """Path-based read/add/remove pro editovatelný glossary.txt. Edit je JEDINÁ
+    mutující operace; zápis je atomický a zachovává hlavičku, komentáře i pořadí.
+    """
+
+    def test_read_returns_terms_creating_empty_file(self, tmp_path):
+        """read_glossary_terms vytvoří prázdný soubor (jen hlavička) a vrátí []."""
+        p = _gp(tmp_path)
+        assert not os.path.exists(p)
+        assert read_glossary_terms(p) == []
+        assert os.path.exists(p)  # vytvořen na vyžádání
+        # nově vzniklý soubor má jen komentářovou hlavičku
+        content = (tmp_path / "glossary.txt").read_text(encoding="utf-8")
+        assert content.lstrip().startswith("#")
+
+    def test_read_returns_existing_terms_dedup(self, tmp_path):
+        """read vrátí termíny ze souboru (bez komentářů/prázdných, dedup)."""
+        p = _gp(tmp_path)
+        (tmp_path / "glossary.txt").write_text(
+            "# hlavička\nelem6\nClaude\nclaude\n\nKubernetes\n", encoding="utf-8"
+        )
+        assert read_glossary_terms(p) == ["elem6", "Claude", "Kubernetes"]
+
+    def test_add_appends_new_terms_returns_full_list(self, tmp_path):
+        """add připojí nové termíny a vrátí výsledný plný seznam."""
+        p = _gp(tmp_path)
+        (tmp_path / "glossary.txt").write_text("# h\nelem6\n", encoding="utf-8")
+        result = add_glossary_terms(p, ["Kubernetes", "Claude"])
+        assert result == ["elem6", "Kubernetes", "Claude"]
+        assert read_glossary_terms(p) == ["elem6", "Kubernetes", "Claude"]
+
+    def test_add_dedups_case_insensitive(self, tmp_path):
+        """add nepřidá termín, který už (case-insensitivně) existuje, ani duplicitu
+        v rámci jednoho volání."""
+        p = _gp(tmp_path)
+        (tmp_path / "glossary.txt").write_text("elem6\n", encoding="utf-8")
+        # 'ELEM6' už je (case-insens.); 'Foo'/'foo' v jednom volání jednou.
+        result = add_glossary_terms(p, ["ELEM6", "Foo", "foo", "  ", "Bar"])
+        assert result == ["elem6", "Foo", "Bar"]
+        # v souboru je 'elem6' jen jednou (nepřidal se 'ELEM6')
+        assert [t for t in result if t.casefold() == "elem6"] == ["elem6"]
+
+    def test_add_preserves_comments_and_header(self, tmp_path):
+        """add zachová komentářovou hlavičku i '#'/prázdné řádky uvnitř souboru."""
+        p = _gp(tmp_path)
+        original = "# hlavicka 1\n# hlavicka 2\n\nelem6\n# pozn\n"
+        (tmp_path / "glossary.txt").write_text(original, encoding="utf-8")
+        add_glossary_terms(p, ["Kubernetes"])
+        content = (tmp_path / "glossary.txt").read_text(encoding="utf-8")
+        # všechny komentáře a původní termín tam pořád jsou
+        assert "# hlavicka 1" in content
+        assert "# hlavicka 2" in content
+        assert "# pozn" in content
+        assert "elem6" in content
+        assert "Kubernetes" in content
+        # komentáře zůstaly před nově přidaným termínem (append na konec)
+        assert content.index("# pozn") < content.index("Kubernetes")
+
+    def test_remove_is_case_insensitive_keeps_comments(self, tmp_path):
+        """remove smaže termín case-insensitivně, komentáře a ostatní termíny nechá."""
+        p = _gp(tmp_path)
+        (tmp_path / "glossary.txt").write_text(
+            "# hlavicka\nelem6\nClaude\nKubernetes\n# pozn na konci\n",
+            encoding="utf-8",
+        )
+        result = remove_glossary_terms(p, ["CLAUDE"])  # jiná velikost písmen
+        assert result == ["elem6", "Kubernetes"]
+        content = (tmp_path / "glossary.txt").read_text(encoding="utf-8")
+        assert "Claude" not in content
+        assert "# hlavicka" in content
+        assert "# pozn na konci" in content
+        assert "elem6" in content and "Kubernetes" in content
+
+    def test_remove_ignores_unknown_and_blank_terms(self, tmp_path):
+        """remove neznámého/ prázdného termínu nic neudělá (vrátí stávající)."""
+        p = _gp(tmp_path)
+        (tmp_path / "glossary.txt").write_text("elem6\nClaude\n", encoding="utf-8")
+        assert remove_glossary_terms(p, ["neexistuje", "   "]) == ["elem6", "Claude"]
+        assert remove_glossary_terms(p, []) == ["elem6", "Claude"]
+
+    def test_atomic_write_leaves_valid_file_no_tmp_left(self, tmp_path):
+        """Po add/remove je soubor validní (čte se zpět) a nezůstane žádný .tmp."""
+        p = _gp(tmp_path)
+        add_glossary_terms(p, ["elem6", "Kubernetes"])
+        remove_glossary_terms(p, ["elem6"])
+        assert read_glossary_terms(p) == ["Kubernetes"]
+        # žádné dočasné soubory po atomickém zápisu
+        leftovers = [n for n in os.listdir(tmp_path) if n != "glossary.txt"]
+        assert leftovers == []
+
+    def test_add_then_remove_roundtrip_back_to_empty(self, tmp_path):
+        """Přidání a následné odebrání vrátí slovník do prázdného stavu, hlavička
+        ale zůstane (soubor je dál validní)."""
+        p = _gp(tmp_path)
+        add_glossary_terms(p, ["Foo", "Bar"])
+        assert read_glossary_terms(p) == ["Foo", "Bar"]
+        assert remove_glossary_terms(p, ["Foo", "Bar"]) == []
+        content = (tmp_path / "glossary.txt").read_text(encoding="utf-8")
+        assert content.lstrip().startswith("#")  # hlavička přežila
+
+    def test_helpers_tolerate_missing_directory(self, tmp_path):
+        """Helpery snesou chybějící adresář — vytvoří ho (defenzivní zápis)."""
+        p = str(tmp_path / "nested" / "deep" / "glossary.txt")
+        result = add_glossary_terms(p, ["elem6"])
+        assert result == ["elem6"]
+        assert os.path.exists(p)

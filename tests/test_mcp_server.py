@@ -13,9 +13,12 @@ import pytest
 from app.app_info import resolve_notes_dir
 from app.mcp_server import (
     _resolve_note_path,
+    add_glossary_terms_tool,
+    get_glossary_tool,
     get_today,
     get_transcript,
     list_recent_meetings,
+    remove_glossary_terms_tool,
     search_transcripts,
 )
 
@@ -291,3 +294,65 @@ def test_resolver_never_raises_without_localappdata(monkeypatch):
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
     resolved = resolve_notes_dir()
     assert os.path.isabs(resolved)
+
+
+# --------------------------------------------------------------------------- #
+# Glossary tools (the ONLY writable surface) — get/add/remove against a temp    #
+# glossary.txt. We point resolve_glossary_path at tmp_path so tests don't touch #
+# the real file. Transcripts stay read-only (no tool writes notes).            #
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def glossary_path(tmp_path, monkeypatch):
+    """Namíří MCP glossary nástroje na glossary.txt v tmp_path."""
+    import app.mcp_server as srv
+
+    p = str(tmp_path / "glossary.txt")
+    monkeypatch.setattr(srv, "resolve_glossary_path", lambda: p)
+    return p
+
+
+def test_get_glossary_tool_empty_then_creates_file(glossary_path):
+    """get_glossary vrátí {"glossary": []} a vytvoří prázdný soubor na vyžádání."""
+    assert not os.path.exists(glossary_path)
+    out = json.loads(get_glossary_tool())
+    assert out == {"glossary": []}
+    assert os.path.exists(glossary_path)  # vytvořen (jen hlavička)
+
+
+def test_add_glossary_terms_tool_adds_and_reports(glossary_path):
+    """add_glossary_terms přidá termíny a vrátí {added, glossary}."""
+    out = json.loads(add_glossary_terms_tool(["elem6", "Kubernetes"]))
+    assert out["added"] == ["elem6", "Kubernetes"]
+    assert out["glossary"] == ["elem6", "Kubernetes"]
+    # potvrzení přes get_glossary (čte ze souboru)
+    assert json.loads(get_glossary_tool())["glossary"] == ["elem6", "Kubernetes"]
+
+
+def test_add_glossary_terms_tool_skips_existing_case_insensitive(glossary_path):
+    """Už existující termín (case-insens.) se nepřidá podruhé — added je prázdné."""
+    add_glossary_terms_tool(["elem6"])
+    out = json.loads(add_glossary_terms_tool(["ELEM6", "Claude"]))
+    assert out["added"] == ["Claude"]          # elem6 už byl, nepřidán
+    assert out["glossary"] == ["elem6", "Claude"]
+
+
+def test_remove_glossary_terms_tool_removes_and_reports(glossary_path):
+    """remove_glossary_terms smaže termín (case-insens.) a vrátí {removed, glossary}."""
+    add_glossary_terms_tool(["elem6", "Claude", "Kubernetes"])
+    out = json.loads(remove_glossary_terms_tool(["CLAUDE"]))
+    assert out["removed"] == ["Claude"]
+    assert out["glossary"] == ["elem6", "Kubernetes"]
+    # neznámý termín nic nesmaže
+    out2 = json.loads(remove_glossary_terms_tool(["neexistuje"]))
+    assert out2["removed"] == []
+    assert out2["glossary"] == ["elem6", "Kubernetes"]
+
+
+def test_glossary_tools_roundtrip_add_read_remove(glossary_path):
+    """End-to-end: add -> get -> remove vrátí slovník zpět do prázdna."""
+    add_glossary_terms_tool(["Foo", "Bar"])
+    assert json.loads(get_glossary_tool())["glossary"] == ["Foo", "Bar"]
+    out = json.loads(remove_glossary_terms_tool(["Foo", "Bar"]))
+    assert out["removed"] == ["Foo", "Bar"]
+    assert out["glossary"] == []

@@ -4,10 +4,15 @@ This is a Model Context Protocol (MCP) server (FastMCP, stdio transport) that
 lets Claude — and any skill/task — query the Meeting Notetaker transcripts as
 first-class tools, the same way a Granola or Fio-banka connector works.
 
-It is STRICTLY READ-ONLY: it lists, searches and reads notes, and never writes,
-modifies or deletes anything. The data logic lives in plain functions that take
-a ``notes_dir`` argument (easy to unit-test without a live stdio loop); the MCP
-tools are thin wrappers that resolve the notes directory and call them.
+Transcripts are STRICTLY READ-ONLY: the server lists, searches and reads notes,
+and never writes, modifies or deletes any transcript. The ONLY mutating
+capability is editing the transcription *glossary* (``glossary.txt``) — the
+small list of names/tools/jargon that biases Whisper so they aren't
+mis-transcribed; ``get_glossary`` / ``add_glossary_terms`` / ``remove_glossary_terms``
+read and edit that one file. The data logic lives in plain functions (the
+transcript ones take a ``notes_dir`` argument; the glossary ones take an explicit
+``path``), easy to unit-test without a live stdio loop; the MCP tools are thin
+wrappers that resolve the relevant path and call them.
 
 Notes are markdown files (``notes/*.md``) with a YAML frontmatter header and a
 ``## Přepis`` section of ``[HH:MM:SS] …`` transcript lines; ``notes/index.jsonl``
@@ -25,8 +30,18 @@ import json
 import os
 from datetime import date, datetime
 
-# resolve_notes_dir locates the transcripts for both dev and installed builds.
-from app.app_info import resolve_notes_dir
+# resolve_notes_dir locates the transcripts for both dev and installed builds;
+# resolve_glossary_path locates the single editable glossary.txt the same way.
+from app.app_info import resolve_glossary_path, resolve_notes_dir
+
+# Path-based glossary helpers (read + the ONLY mutating capability: edit the
+# glossary). Aliased so the thin MCP wrappers can keep clean tool names without
+# shadowing the underlying functions.
+from app.glossary import (
+    add_glossary_terms as _add_glossary_terms,
+    read_glossary_terms as _read_glossary_terms,
+    remove_glossary_terms as _remove_glossary_terms,
+)
 
 # Fields surfaced from a single index.jsonl record (in this order).
 _INDEX_FIELDS = (
@@ -346,6 +361,76 @@ def get_today_tool() -> str:
     """
     notes_dir = resolve_notes_dir()
     return _json(get_today(notes_dir))
+
+
+# --------------------------------------------------------------------------- #
+# Glossary tools — the ONLY writable surface. They manage Ivan's transcription  #
+# glossary (names/tools/jargon Whisper would otherwise mis-transcribe). Each    #
+# resolves the single editable glossary.txt and calls a path-based helper.      #
+# Transcripts/notes stay strictly read-only.                                    #
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool(name="get_glossary")
+def get_glossary_tool() -> str:
+    """Return Ivan's current transcription glossary (his custom vocabulary).
+
+    The glossary is a small list of names, tool/product names and jargon that
+    biases the Meeting Notetaker's Czech transcription so those words aren't
+    mis-transcribed (e.g. ``elem6``, ``Claude``, ``Kubernetes``). It is the only
+    editable surface of this server — transcripts themselves are read-only.
+    Returns a JSON object ``{"glossary": [...]}`` with the terms in file order.
+    Use ``add_glossary_terms`` / ``remove_glossary_terms`` to change it.
+    """
+    path = resolve_glossary_path()
+    return _json({"glossary": _read_glossary_terms(path)})
+
+
+@mcp.tool(name="add_glossary_terms")
+def add_glossary_terms_tool(terms: "list[str]") -> str:
+    """Add terms to Ivan's transcription glossary (names/tools/jargon).
+
+    Use this to teach the Meeting Notetaker words it keeps getting wrong — e.g. a
+    colleague's name, a product or a piece of jargon — so future recordings
+    transcribe them correctly. Terms already present (case-insensitively) are
+    skipped; the glossary file's comments and ordering are preserved. The change
+    applies to the NEXT transcription (no restart needed). This glossary is the
+    only thing this server can edit — meeting transcripts/notes stay read-only.
+    Returns JSON ``{"added": [...], "glossary": [...]}`` (the terms newly added
+    and the resulting full glossary).
+
+    Args:
+        terms: Words/phrases to add (e.g. ["elem6", "Kubernetes"]).
+    """
+    path = resolve_glossary_path()
+    before = {t.casefold() for t in _read_glossary_terms(path)}
+    glossary = _add_glossary_terms(path, terms or [])
+    added = [t for t in glossary if t.casefold() not in before]
+    return _json({"added": added, "glossary": glossary})
+
+
+@mcp.tool(name="remove_glossary_terms")
+def remove_glossary_terms_tool(terms: "list[str]") -> str:
+    """Remove terms from Ivan's transcription glossary.
+
+    Use this to drop words that no longer belong in the Meeting Notetaker's
+    custom vocabulary (the names/tools/jargon that bias Czech transcription).
+    Matching is case-insensitive; comments and other terms are kept and the file
+    structure is preserved. The change applies to the NEXT transcription. This
+    glossary is the only thing this server can edit — meeting transcripts/notes
+    stay strictly read-only. Returns JSON ``{"removed": [...], "glossary": [...]}``
+    (the terms actually removed and the resulting full glossary).
+
+    Args:
+        terms: Words/phrases to remove (case-insensitive match).
+    """
+    path = resolve_glossary_path()
+    before = _read_glossary_terms(path)
+    before_keys = {t.casefold() for t in before}
+    glossary = _remove_glossary_terms(path, terms or [])
+    after_keys = {t.casefold() for t in glossary}
+    removed = [t for t in before if t.casefold() in before_keys - after_keys]
+    return _json({"removed": removed, "glossary": glossary})
 
 
 def main() -> None:

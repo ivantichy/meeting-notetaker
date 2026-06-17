@@ -7,7 +7,7 @@ ukazují skutečné umístění přepisů. A nesmí NIKDY shodit start (defenziv
 import json
 import os
 
-from app.app_info import app_info_path, write_app_info
+from app.app_info import app_info_path, resolve_glossary_path, write_app_info
 from app.config import AppConfig
 
 
@@ -39,6 +39,10 @@ def test_write_produces_valid_json_with_absolute_paths(tmp_path, monkeypatch):
     assert os.path.isabs(data["app_dir"])
     assert data["notes_dir"] == os.path.abspath("notes")
     assert data["index"] == os.path.join(data["notes_dir"], "index.jsonl")
+
+    # glossary.txt je publikován jako ABSOLUTNÍ cesta v adresáři appky (app_dir).
+    assert os.path.isabs(data["glossary"])
+    assert data["glossary"] == os.path.join(data["app_dir"], "glossary.txt")
 
 
 def test_absolute_notes_dir_preserved(tmp_path, monkeypatch):
@@ -89,3 +93,55 @@ def test_unwritable_base_dir_does_not_raise(tmp_path, monkeypatch):
 
     # Nesmí vyhodit výjimku (defenzivní try/except).
     write_app_info(AppConfig(notes_dir="notes"))
+
+
+# --------------------------------------------------------------------------- #
+# resolve_glossary_path — glossary.txt v adresáři appky, robustně dev/instalace #
+# --------------------------------------------------------------------------- #
+
+def test_resolve_glossary_prefers_app_info_app_dir(tmp_path, monkeypatch):
+    """Resolver vybere app_dir z app-info.json, když ten adresář existuje, a
+    vrátí v něm glossary.txt jako absolutní cestu."""
+    import app.app_info as app_info
+
+    local = tmp_path / "LocalAppData"
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    # Izoluj od reálného dev checkoutu na stroji.
+    monkeypatch.setattr(app_info, "DEV_APP_DIR", str(tmp_path / "no-dev"))
+    monkeypatch.chdir(tmp_path)
+
+    real_app = tmp_path / "real-app"
+    real_app.mkdir()
+    base = local / "MeetingNotetaker"
+    base.mkdir(parents=True)
+    (base / "app-info.json").write_text(
+        json.dumps({"app_dir": str(real_app)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_glossary_path()
+    assert resolved == os.path.join(os.path.abspath(str(real_app)), "glossary.txt")
+
+
+def test_resolve_glossary_falls_back_to_cwd_when_nothing_exists(
+    tmp_path, monkeypatch
+):
+    """Když žádný kandidátní adresář appky neexistuje, vrátí glossary.txt v cwd
+    (absolutní) a NIKDY nevyhodí výjimku."""
+    import app.app_info as app_info
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "nope"))
+    monkeypatch.setattr(app_info, "DEV_APP_DIR", str(tmp_path / "no-dev"))
+    monkeypatch.chdir(tmp_path)
+
+    resolved = resolve_glossary_path()
+    assert os.path.isabs(resolved)
+    assert os.path.basename(resolved) == "glossary.txt"
+    assert resolved == os.path.abspath("glossary.txt")
+
+
+def test_resolve_glossary_never_raises_without_localappdata(monkeypatch):
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    resolved = resolve_glossary_path()
+    assert os.path.isabs(resolved)
+    assert os.path.basename(resolved) == "glossary.txt"

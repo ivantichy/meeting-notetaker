@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +150,133 @@ def _dedup_preserve_order(items: "list[str]") -> list[str]:
         seen.add(key)
         out.append(it)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Path-based read/add/remove helpers for the editable glossary.txt.            #
+#                                                                              #
+# Tyto funkce berou VÝSLOVNĚ ``path`` a zapisují ATOMICKY (temp + os.replace), #
+# přičemž zachovávají komentářovou hlavičku i případné '#'/prázdné řádky a     #
+# pořadí termínů. Soubor je jediný zdroj pravdy; uživatel ho edituje za běhu.  #
+# Vědomě NEexistuje "přepiš celý soubor" — měnit lze jen přidáním/odebráním.   #
+# --------------------------------------------------------------------------- #
+
+
+def _read_glossary_raw_lines(path: str) -> list[str]:
+    """Přečte syrové řádky ``glossary.txt`` (vytvoří ho prázdný, když chybí).
+
+    Vrací řádky bez koncových newline (zachovává komentáře i prázdné řádky, ať
+    je add/remove umí zapsat zpět). Plně defenzivní: chyba čtení -> prázdný
+    seznam (zachází se s tím jako s prázdným souborem, hlavička se dopíše).
+    """
+    try:
+        ensure_glossary_file(path)
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().splitlines()
+    except OSError:
+        log.exception("Čtení %s selhalo — beru ho jako prázdný.", path)
+        return []
+
+
+def _atomic_write_lines(path: str, lines: "list[str]") -> None:
+    """Zapíše ``lines`` (každý + '\\n') do ``path`` ATOMICKY (temp + os.replace).
+
+    Paralelní čtenář (přepis) nikdy neuvidí napůl zapsaný soubor. Defenzivní:
+    chybu jen zaloguje (edit slovníku nesmí shodit UI ani přepis). Vytvoří
+    chybějící adresář, ať to projde i na čisté instalaci.
+    """
+    try:
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        os.makedirs(directory, exist_ok=True)
+        content = "".join(f"{ln}\n" for ln in lines)
+        fd, tmp = tempfile.mkstemp(prefix="glossary.", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            # Když rename selhal, ukliď dočasný soubor (best-effort).
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+    except OSError:
+        log.exception("Zápis %s selhal (ignoruji).", path)
+
+
+def read_glossary_terms(path: str) -> list[str]:
+    """Vrátí termíny ze slovníku na ``path`` (jeden termín na řádek; prázdné
+    řádky a '#' komentáře ignoruje, case-insensitivní dedup, pořadí zachová).
+
+    Soubor je jediný zdroj pravdy. Když chybí, vytvoří se PRÁZDNÝ (jen hlavička).
+    Tenký obal nad ``_load_glossary_terms`` — vždy s výslovnou cestou.
+    """
+    return _load_glossary_terms(path)
+
+
+def add_glossary_terms(path: str, terms: "list[str]") -> list[str]:
+    """Přidá ``terms``, které ve slovníku ještě NEjsou (case-insensitivní dedup
+    proti stávajícím termínům i mezi sebou), a vrátí výsledný seznam termínů.
+
+    Zachovává komentářovou hlavičku a všechny '#'/prázdné řádky; nové termíny
+    APPENDuje na konec. Zapisuje atomicky. Prázdné/whitespace termíny ignoruje.
+    NEpřepisuje celý soubor — jen doplňuje řádky.
+    """
+    raw = _read_glossary_raw_lines(path)
+    existing = read_glossary_terms(path)
+    have = {t.casefold() for t in existing}
+
+    to_add: list[str] = []
+    for raw_term in terms or []:
+        term = (raw_term or "").strip()
+        if not term:
+            continue
+        key = term.casefold()
+        if key in have:
+            continue
+        have.add(key)
+        to_add.append(term)
+
+    if to_add:
+        new_lines = list(raw)
+        # Když poslední řádek souboru není prázdný, oddělíme nové termíny —
+        # ať se neslepí s posledním komentářem/termínem (čitelnost souboru).
+        if new_lines and new_lines[-1].strip():
+            new_lines.append("")
+        new_lines.extend(to_add)
+        _atomic_write_lines(path, new_lines)
+
+    return read_glossary_terms(path)
+
+
+def remove_glossary_terms(path: str, terms: "list[str]") -> list[str]:
+    """Odebere ne-komentářové řádky, jejichž hodnota se (case-insensitivně) rovná
+    některému z ``terms``; komentáře, prázdné řádky a ostatní termíny zachová.
+    Vrací výsledný seznam termínů.
+
+    Zapisuje atomicky. Prázdné/whitespace položky v ``terms`` ignoruje.
+    """
+    raw = _read_glossary_raw_lines(path)
+    drop = {(t or "").strip().casefold() for t in (terms or []) if (t or "").strip()}
+    if not drop:
+        return read_glossary_terms(path)
+
+    kept: list[str] = []
+    for line in raw:
+        stripped = line.strip()
+        # Komentáře a prázdné řádky vždy zachováme (struktura souboru).
+        if not stripped or stripped.startswith("#"):
+            kept.append(line)
+            continue
+        if stripped.casefold() in drop:
+            continue  # smazat tento termín
+        kept.append(line)
+
+    _atomic_write_lines(path, kept)
+    return read_glossary_terms(path)
 
 
 def _clean_attendee_names(attendees: "list[str] | None") -> list[str]:

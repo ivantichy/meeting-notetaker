@@ -63,11 +63,15 @@ def write_app_info(cfg) -> None:
         notes_dir = os.path.abspath(cfg.notes_dir)
         app_dir = os.path.abspath(os.getcwd())
         index_path = os.path.join(notes_dir, "index.jsonl")
+        # Editovatelný slovník leží v adresáři appky (vedle config.json), ne v
+        # notes diru — locator ho zveřejní absolutní cestou pro MCP/skilly.
+        glossary_path = os.path.join(app_dir, "glossary.txt")
         payload = {
             "app": "Meeting Notetaker",
             "notes_dir": notes_dir,
             "app_dir": app_dir,
             "index": index_path,
+            "glossary": glossary_path,
             "transcripts": True,
             "transcript_format": TRANSCRIPT_FORMAT,
             "updated": datetime.now(timezone.utc).isoformat(),
@@ -127,8 +131,45 @@ def _installed_notes_dir() -> "str | None":
     return os.path.join(local, "Programs", "MeetingNotetaker", "notes")
 
 
+def _read_app_info_app_dir() -> "str | None":
+    """Přečte ``app_dir`` z locatoru app-info.json (zapsaného běžící appkou).
+
+    Vrací ``None`` při jakékoliv chybě (chybí ``LOCALAPPDATA``, soubor neexistuje,
+    nevalidní JSON, chybí klíč). Plně defenzivní — nikdy nevyhodí výjimku.
+    """
+    try:
+        path = app_info_path()
+        if path is None or not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        app_dir = data.get("app_dir")
+        if isinstance(app_dir, str) and app_dir:
+            return app_dir
+        return None
+    except Exception:  # noqa: BLE001 — resolver nesmí nikdy vyhodit výjimku
+        return None
+
+
+def _installed_app_dir() -> "str | None":
+    """``%LOCALAPPDATA%\\Programs\\MeetingNotetaker`` (nainstalovaný build),
+    nebo ``None`` když ``LOCALAPPDATA`` chybí."""
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return None
+    return os.path.join(local, "Programs", "MeetingNotetaker")
+
+
 #: Dev checkout (vývojový strom): poznámky vedle repozitáře.
 DEV_NOTES_DIR = r"C:\temp\Claude\meeting-notetaker\notes"
+
+#: Dev checkout (vývojový strom): kořen appky (vedle config.json).
+DEV_APP_DIR = r"C:\temp\Claude\meeting-notetaker"
+
+#: Název editovatelného slovníku (leží v adresáři appky, vedle config.json).
+GLOSSARY_FILENAME = "glossary.txt"
 
 
 def resolve_notes_dir() -> str:
@@ -173,3 +214,40 @@ def resolve_notes_dir() -> str:
     if candidates:
         return os.path.abspath(candidates[0])
     return os.path.abspath("notes")
+
+
+def resolve_glossary_path() -> str:
+    """Najde editovatelný ``glossary.txt`` robustně, nezávisle na tom, kde appka
+    běží. Slovník leží v ADRESÁŘI APPKY (vedle config.json), ne v notes diru.
+
+    Pořadí preferencí (vyšší vyhrává) — vybere první kandidátní adresář appky,
+    který REÁLNĚ existuje, a vrátí v něm ``glossary.txt`` jako absolutní cestu:
+
+    1. ``app_dir`` z locatoru ``%LOCALAPPDATA%\\MeetingNotetaker\\app-info.json``
+       (zapsán běžící appkou);
+    2. nainstalovaný build ``%LOCALAPPDATA%\\Programs\\MeetingNotetaker``;
+    3. dev checkout ``C:\\temp\\Claude\\meeting-notetaker``;
+    4. aktuální pracovní adresář (fallback).
+
+    Když žádný z 1–3 neexistuje, použije se cwd. Funkce je plně defenzivní a
+    NIKDY nevyhodí výjimku (vrátí rozumný default i bez ``LOCALAPPDATA``).
+    """
+    candidates = []
+    for cand in (
+        _read_app_info_app_dir(),
+        _installed_app_dir(),
+        DEV_APP_DIR,
+    ):
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    # Vyber první kandidátní adresář appky, který existuje (striktní preference).
+    for cand in candidates:
+        try:
+            if os.path.isdir(cand):
+                return os.path.abspath(os.path.join(cand, GLOSSARY_FILENAME))
+        except OSError:
+            continue
+
+    # Žádný neexistuje — slovník v aktuálním pracovním adresáři (fallback).
+    return os.path.abspath(GLOSSARY_FILENAME)

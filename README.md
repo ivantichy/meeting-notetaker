@@ -102,16 +102,19 @@ There are currently **87 tests** covering calendar parsing, the scheduler, note 
 
 ## MCP server (transcripts as tools)
 
-Meeting Notetaker ships a small **read-only [MCP](https://modelcontextprotocol.io) server** so that Claude (or any skill/task) can query your meeting transcripts as first-class tools — the same way a Granola or banking connector works. It never modifies or deletes notes; it only lists, searches and reads them.
+Meeting Notetaker ships a small **MCP [server](https://modelcontextprotocol.io)** so that Claude (or any skill/task) can query your meeting transcripts as first-class tools — the same way a Granola or banking connector works. Transcripts are **read-only**: it lists, searches and reads notes, and never modifies or deletes them. The **only** thing it can edit is your transcription *glossary* (`glossary.txt`) — the small list of names, tools and jargon that biases transcription so they aren't garbled.
 
-It exposes four tools over stdio:
+It exposes seven tools over stdio — four read-only transcript tools and three that read/edit the glossary:
 
 - `list_recent_meetings(limit=20)` — recent meetings from `notes/index.jsonl`, newest first (uid, title, platform, start/recorded times, duration, note filename, quality).
 - `search_transcripts(query, limit=20)` — case-insensitive full-text search across `notes/*.md`, returning the matching note, its title and a short snippet around each hit.
 - `get_transcript(note)` — the full Markdown of one note; `note` is a filename (from the two tools above) or a meeting `uid`. Sandboxed: only a note **inside** your notes folder can be read.
 - `get_today()` — convenience list of meetings recorded today.
+- `get_glossary()` — the current glossary terms (your custom transcription vocabulary).
+- `add_glossary_terms(terms)` — add names/tools/jargon to the glossary (case-insensitive dedup); returns `{added, glossary}`. Applies to the next transcription.
+- `remove_glossary_terms(terms)` — remove terms from the glossary (case-insensitive); returns `{removed, glossary}`. Applies to the next transcription.
 
-The server finds your transcripts automatically whether you run the installed build or from source: it reads the `notes_dir` published in `%LOCALAPPDATA%\MeetingNotetaker\app-info.json`, falling back to `%LOCALAPPDATA%\Programs\MeetingNotetaker\notes`, then the dev checkout, then `notes\` next to the current directory.
+The server finds your transcripts automatically whether you run the installed build or from source: it reads the `notes_dir` published in `%LOCALAPPDATA%\MeetingNotetaker\app-info.json`, falling back to `%LOCALAPPDATA%\Programs\MeetingNotetaker\notes`, then the dev checkout, then `notes\` next to the current directory. The glossary file is located the same way — `glossary.txt` in the app directory (`app_dir` from `app-info.json`, then the installed path, then the dev checkout, then the current directory).
 
 ### Run it
 
