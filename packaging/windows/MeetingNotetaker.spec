@@ -1,4 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
@@ -65,12 +67,84 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,  # viz EXE výše — UPX na nativních DLL je rizikové (M11)
-    upx_exclude=[],
-    name='MeetingNotetaker',
-)
+# --------------------------------------------------------------------------- #
+# Druhý, KONZOLOVÝ exe: meeting-notetaker-mcp (read-only MCP server). Sdílí     #
+# stejný onedir (_internal) jako GUI — jen přidá vlastní entry + závislosti     #
+# 'mcp'. Když 'mcp' není při buildu k dispozici, druhý exe se PŘESKOČÍ a hlavní #
+# build (GUI) zůstane nedotčen (rozbitý hlavní build je horší než chybějící     #
+# druhý exe). Plnou registraci connectoru popisuje README (sekce „MCP server"). #
+# --------------------------------------------------------------------------- #
+# Entry je přímo app/mcp_server.py (má vlastní `if __name__ == "__main__"`).
+# Cesta je relativní ke .spec souboru (packaging/windows) -> dva adresáře výš.
+_mcp_entry = os.path.join(SPECPATH, '..', '..', 'app', 'mcp_server.py')
+
+_mcp_hidden = []
+_mcp_ok = os.path.exists(_mcp_entry)
+if _mcp_ok:
+    try:
+        _mcp_hidden = collect_submodules('mcp')
+    except Exception as exc:  # noqa: BLE001
+        print('WARNING: [spec] collect_submodules("mcp") selhalo:', exc)
+        _mcp_ok = False
+
+if _mcp_ok:
+    a_mcp = Analysis(
+        [_mcp_entry],
+        pathex=['.'],
+        binaries=[],
+        datas=[],
+        # FastMCP staví na pydantic/anyio/starlette; přibal je i s podmoduly mcp.
+        hiddenimports=_mcp_hidden + [
+            'mcp', 'mcp.server', 'mcp.server.fastmcp',
+            'anyio', 'pydantic', 'pydantic_core',
+        ],
+        hookspath=[],
+        hooksconfig={},
+        runtime_hooks=[],
+        excludes=['PySide6'],  # MCP server GUI vůbec nepotřebuje
+        noarchive=False,
+        optimize=0,
+    )
+    pyz_mcp = PYZ(a_mcp.pure)
+    exe_mcp = EXE(
+        pyz_mcp,
+        a_mcp.scripts,
+        [],
+        exclude_binaries=True,
+        name='meeting-notetaker-mcp',
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,  # stejný důvod jako u GUI exe (M11)
+        console=True,  # MCP komunikuje přes stdio; běží bez viditelného okna
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+    # Jeden COLLECT pro OBA exe -> sdílený dist\MeetingNotetaker\_internal.
+    # PyInstaller dedupuje shodné TOC položky, takže velikost zůstane rozumná.
+    coll = COLLECT(
+        exe,
+        exe_mcp,
+        a.binaries,
+        a.datas,
+        a_mcp.binaries,
+        a_mcp.datas,
+        strip=False,
+        upx=False,  # viz EXE výše — UPX na nativních DLL je rizikové (M11)
+        upx_exclude=[],
+        name='MeetingNotetaker',
+    )
+else:
+    print('WARNING: [spec] mcp entry/balík nenalezen -> stavím jen GUI exe.')
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,  # viz EXE výše — UPX na nativních DLL je rizikové (M11)
+        upx_exclude=[],
+        name='MeetingNotetaker',
+    )

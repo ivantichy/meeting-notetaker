@@ -100,6 +100,66 @@ The project ships with a unit-test suite that runs without any audio or Whisper 
 
 There are currently **87 tests** covering calendar parsing, the scheduler, note storage, the recorder state machine, call detection, and post-processing. `ARCHITECTURE.md` describes the module layout, contracts, and threading model.
 
+## MCP server (transcripts as tools)
+
+Meeting Notetaker ships a small **read-only [MCP](https://modelcontextprotocol.io) server** so that Claude (or any skill/task) can query your meeting transcripts as first-class tools — the same way a Granola or banking connector works. It never modifies or deletes notes; it only lists, searches and reads them.
+
+It exposes four tools over stdio:
+
+- `list_recent_meetings(limit=20)` — recent meetings from `notes/index.jsonl`, newest first (uid, title, platform, start/recorded times, duration, note filename, quality).
+- `search_transcripts(query, limit=20)` — case-insensitive full-text search across `notes/*.md`, returning the matching note, its title and a short snippet around each hit.
+- `get_transcript(note)` — the full Markdown of one note; `note` is a filename (from the two tools above) or a meeting `uid`. Sandboxed: only a note **inside** your notes folder can be read.
+- `get_today()` — convenience list of meetings recorded today.
+
+The server finds your transcripts automatically whether you run the installed build or from source: it reads the `notes_dir` published in `%LOCALAPPDATA%\MeetingNotetaker\app-info.json`, falling back to `%LOCALAPPDATA%\Programs\MeetingNotetaker\notes`, then the dev checkout, then `notes\` next to the current directory.
+
+### Run it
+
+```bat
+:: From source (dev checkout)
+.venv\Scripts\python.exe -m app.mcp_server
+```
+
+The installed build ships a console executable next to the app:
+
+```
+%LOCALAPPDATA%\Programs\MeetingNotetaker\meeting-notetaker-mcp.exe
+```
+
+It speaks MCP over stdin/stdout, so running it directly just waits for a client — that is expected.
+
+### Register it as a connector
+
+Add an `mcpServers` entry to your MCP client configuration. **You register it yourself**; the app does not touch any Claude/MCP config.
+
+Dev checkout (replace `<repo>` with the absolute path to this project):
+
+```json
+{
+  "mcpServers": {
+    "meeting-notetaker": {
+      "command": "<repo>\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "app.mcp_server"]
+    }
+  }
+}
+```
+
+Installed build:
+
+```json
+{
+  "mcpServers": {
+    "meeting-notetaker": {
+      "command": "%LOCALAPPDATA%\\Programs\\MeetingNotetaker\\meeting-notetaker-mcp.exe",
+      "args": []
+    }
+  }
+}
+```
+
+(If your client does not expand environment variables in paths, write the resolved absolute path to `meeting-notetaker-mcp.exe`.) After registering, restart the client; the four tools above appear under the **meeting-notetaker** server.
+
 ## License
 
 Released under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -12,3 +12,6 @@ python-dateutil==2.9.0.post0
 tzdata==2026.2
 # Used by faster-whisper (PyAV) and bundled explicitly by the PyInstaller spec.
 av==17.1.0
+# Model Context Protocol SDK — powers the read-only meeting-transcript MCP
+# server (app/mcp_server.py); FastMCP + stdio transport.
+mcp==1.26.0

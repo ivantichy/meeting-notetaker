@@ -94,3 +94,82 @@ def write_app_info(cfg) -> None:
         log.info("Zapsán locator app-info.json: %s (notes_dir=%s)", path, notes_dir)
     except Exception:  # noqa: BLE001 — locator nesmí nikdy shodit start
         log.warning("Zápis app-info.json selhal (ignoruji).", exc_info=True)
+
+
+def _read_app_info_notes_dir() -> "str | None":
+    """Přečte ``notes_dir`` z locatoru app-info.json (zapsaného běžící appkou).
+
+    Vrací ``None`` při jakékoliv chybě (chybí ``LOCALAPPDATA``, soubor neexistuje,
+    nevalidní JSON, chybí klíč). Plně defenzivní — nikdy nevyhodí výjimku.
+    """
+    try:
+        path = app_info_path()
+        if path is None or not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        notes_dir = data.get("notes_dir")
+        if isinstance(notes_dir, str) and notes_dir:
+            return notes_dir
+        return None
+    except Exception:  # noqa: BLE001 — resolver nesmí nikdy vyhodit výjimku
+        return None
+
+
+def _installed_notes_dir() -> "str | None":
+    """``%LOCALAPPDATA%\\Programs\\MeetingNotetaker\\notes`` (nainstalovaný build),
+    nebo ``None`` když ``LOCALAPPDATA`` chybí."""
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return None
+    return os.path.join(local, "Programs", "MeetingNotetaker", "notes")
+
+
+#: Dev checkout (vývojový strom): poznámky vedle repozitáře.
+DEV_NOTES_DIR = r"C:\temp\Claude\meeting-notetaker\notes"
+
+
+def resolve_notes_dir() -> str:
+    """Najde adresář s přepisy robustně, nezávisle na tom, kde appka běží.
+
+    Pořadí preferencí (vyšší vyhrává):
+
+    1. ``notes_dir`` z locatoru ``%LOCALAPPDATA%\\MeetingNotetaker\\app-info.json``
+       (zapsán běžící appkou) — pokud ten adresář existuje;
+    2. nainstalovaný build ``%LOCALAPPDATA%\\Programs\\MeetingNotetaker\\notes``;
+    3. dev checkout ``C:\\temp\\Claude\\meeting-notetaker\\notes``;
+    4. ``notes`` relativně k aktuálnímu pracovnímu adresáři (fallback).
+
+    Z kandidátů, které REÁLNĚ existují, se vybere ten **naposledy modifikovaný**
+    (běžně to bude buildu, který naposledy nahrával). Když žádný neexistuje,
+    vrátí se rozumný default (locator → instalace → dev → cwd/notes) jako
+    absolutní cesta. Funkce je plně defenzivní a NIKDY nevyhodí výjimku.
+    """
+    candidates = []
+    for cand in (
+        _read_app_info_notes_dir(),
+        _installed_notes_dir(),
+        DEV_NOTES_DIR,
+        os.path.join(os.getcwd(), "notes"),
+    ):
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    # Preferuj existující adresáře; z nich ten naposledy modifikovaný.
+    existing = [c for c in candidates if os.path.isdir(c)]
+    if existing:
+        def _mtime(p: str) -> float:
+            try:
+                return os.path.getmtime(p)
+            except OSError:
+                return 0.0
+
+        best = max(existing, key=_mtime)
+        return os.path.abspath(best)
+
+    # Žádný neexistuje — vrať první rozumný default jako absolutní cestu.
+    if candidates:
+        return os.path.abspath(candidates[0])
+    return os.path.abspath("notes")
