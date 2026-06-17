@@ -20,6 +20,7 @@ meeting-notetaker/
     scheduler.py       # decides when to auto start/stop recording
     storage.py         # Markdown note files + transcript appending
     audio_capture.py   # WASAPI loopback + mic capture (via the `soundcard` lib)
+    glossary.py        # editable glossary.txt -> Whisper initial_prompt (names/terms)
     transcriber.py     # faster-whisper wrapper, chunk queue -> segments
     recorder.py        # orchestrates capture -> transcribe -> storage; state machine
     call_detector.py   # detects an active call from microphone usage (registry)
@@ -40,10 +41,15 @@ meeting-notetaker/
     test_recorder.py
     test_call_detector.py
     test_post_processor.py
+    test_glossary.py
+    test_audio_capture.py
+    test_transcriber.py
+    test_config.py
   docs/                # screenshots used by the README
   notes/               # output .md files (content is gitignored)
   models/              # Whisper model cache (gitignored)
   config.json          # created on first run (holds the secret ICS URL; gitignored)
+  glossary.txt         # editable transcription glossary, created empty next to config.json (gitignored)
   requirements.txt
   run.bat              # venv python -m app.main
   README.md
@@ -78,6 +84,8 @@ class Meeting:
     platform: Platform
     join_url: str | None = None
     attendees: list[str] = field(default_factory=list)
+    attendee_names: list[str] = field(default_factory=list)  # display names (CN) from the invite, for the prompt glossary
+    description: str = ""                                    # cleaned DESCRIPTION (no URLs/emails/boilerplate); topic terms are extracted from it
     @property
     def slug(self) -> str: ...   # "2026-06-12_1330_meeting-title" (ascii, max 60)
 ```
@@ -167,9 +175,12 @@ class NoteStore:
         """Append a '[HH:MM:SS] text' line (t = seconds from the start of the recording)."""
     def finalize(self, path: str, duration_s: float) -> None:
         """Set frontmatter status: done + duration."""
-    def replace_transcript(self, path: str, segments: list) -> None:
+    def replace_transcript(self, path: str, segments: list) -> bool:
         """Replace the transcript section with the higher-quality re-transcription
-        (used by the post-processor); records the model quality and speaker labels."""
+        (used by the post-processor); records the model quality and speaker labels.
+        Guard against data loss: if the final transcript is empty or much shorter
+        than the existing (live) one, the replacement is skipped and False is
+        returned (the caller must then keep the WAV); otherwise returns True."""
     def list_notes(self) -> list[dict]: ...   # [{path, title, start, status}]
     # index.jsonl: index_add / index_mark_final keep a lightweight machine-readable index.
 ```
@@ -197,6 +208,31 @@ class AudioCapture:
 The recorder also keeps the raw stereo audio (channel 0 = microphone, channel 1 =
 loopback) so the post-processor can attribute speakers later.
 
+### glossary.py
+
+```python
+GLOSSARY_FILENAME = "glossary.txt"   # editable glossary next to config.json
+def ensure_glossary_file(path: str | None = None) -> str: ...
+    # Create glossary.txt EMPTY (header comment only) if missing; returns the path.
+def extract_topic_terms(title: str, description: str) -> list[str]: ...
+    # Locally and deterministically mine "identifier-ish" terms (tool/product
+    # names, acronyms, codes) from a meeting's title+description (precision over recall).
+def build_initial_prompt(attendees: list[str] | None = None, title: str | None = None,
+                         glossary_path: str | None = None,
+                         topic_terms: list[str] | None = None) -> str: ...
+    # Per-meeting Whisper initial_prompt.
+```
+
+The editable `glossary.txt` is the **single source of truth** for terms — there is
+no built-in glossary (the `GLOSSARY_TERMS` constant is intentionally empty), so the
+user freely adds and removes terms; changes apply to the next transcription with no
+rebuild. The topic is **not** hardcoded: `BASE_PROMPT` is neutral and the real topic
+comes from the meeting's calendar title. The prompt is assembled per meeting: the
+intro + title + auto-mined `topic_terms` go at the **head** (least trusted, dropped
+first under budget), and the glossary + attendee names go at the **end** so they
+survive Whisper's tail-keeping truncation (rough ~224-token budget; attendees capped
+at `MAX_ATTENDEES`).
+
 ### transcriber.py
 
 ```python
@@ -204,8 +240,17 @@ class Transcriber:
     """Owns a faster_whisper.WhisperModel (lazy-loaded on first use, models/ dir,
     device='cpu', compute_type='int8'). A background worker thread consumes a
     queue.Queue of (samples, offset_s) and calls on_segments(list[(t0,t1,text)]).
-    language=cfg.language, vad_filter=True, beam_size=1 for the live pass."""
-    def __init__(self, cfg: AppConfig, on_segments: Callable[[list[tuple[float,float,str]]], None]): ...
+    vad_filter=True, beam_size=1 for the live pass. The language is detected once
+    (multilingual=False): cfg.language is passed verbatim, "auto"/"" -> language=None.
+    Each chunk is transcribed with initial_prompt=build_initial_prompt(attendees,
+    title, topic_terms) (the name/term glossary) to improve recognition."""
+    def __init__(self, cfg: AppConfig,
+                 on_segments: Callable[[list[tuple[float,float,str]]], None],
+                 on_error: Callable[[str], None] | None = None,
+                 model_factory: Callable[[], object] | None = None,
+                 attendees: list[str] | None = None,
+                 title: str | None = None,
+                 topic_terms: list[str] | None = None): ...
     def submit(self, samples: "np.ndarray", offset_s: float) -> None: ...
     def start(self) -> None: ...
     def stop(self, drain: bool = True) -> None: ...   # process the remaining queue, then exit
@@ -323,7 +368,7 @@ requests  icalendar  recurring-ical-events  python-dateutil  tzdata
 `conftest.py` injects `sys.modules['soundcard'] = MagicMock()` (and the same for
 `faster_whisper`) before the app is imported, and provides fixtures: sample ICS text
 (single + recurring + Meet + Teams + an all-day event to ignore), a temp notes dir,
-and a freeze-time helper. The suite has 147 tests:
+and a freeze-time helper. The suite has 206 tests:
 
 - `test_calendar`: parse single/recurring events, platform & URL detection, window
   filtering, sort order, time zones.
@@ -338,6 +383,9 @@ and a freeze-time helper. The suite has 147 tests:
 - `test_post_processor`: happy path replaces the transcript and deletes the WAV, a
   transcription error keeps the WAV and the worker survives, orphan scan, and stereo
   vs. mono speaker attribution.
+- `test_glossary`: empty file creation (header only, no built-ins), runtime add/remove
+  and `#`/blank-line handling, topic-term extraction (precision over recall), and the
+  per-meeting prompt order/token budget (glossary + names protected at the end).
 - `test_audio_capture`: resampling, mono mixing, mic/loopback channel pairing and order,
   clipping, and emit offsets.
 - `test_transcriber`: bounded queue drops oldest, drain on stop, model-load failure is

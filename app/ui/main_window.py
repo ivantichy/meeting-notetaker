@@ -576,8 +576,8 @@ class MainWindow(QMainWindow):
 
     def _open_glossary(self) -> None:
         """Otevře editovatelný slovník ``glossary.txt`` ve výchozím editoru.
-        Když soubor ještě neexistuje, nejdřív ho vytvoří (předvyplněný
-        vestavěnými termíny), ať má uživatel co editovat."""
+        Když soubor ještě neexistuje, nejdřív ho vytvoří PRÁZDNÝ (jen s českou
+        komentářovou hlavičkou), ať má uživatel co editovat."""
         import os as _os
 
         from app.glossary import ensure_glossary_file

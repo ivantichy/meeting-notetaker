@@ -33,6 +33,14 @@ A local, bot-free meeting recorder and notetaker for Windows — records your ca
 
 **Where notes are saved.** Notes are written to the `notes/` folder next to the app, one Markdown file per meeting (for example `notes/2026-06-12_1330_team-standup.md`). Each file has a header (title, time, attendees, platform) and a transcript with `[HH:MM:SS]` timestamps.
 
+## Transcription accuracy
+
+To get names and jargon right, the transcriber is given a short list of words as context. It comes from three sources:
+
+- **Your glossary.** An editable `glossary.txt` lives next to `config.json`. It is created automatically the first time it is needed and **starts empty** (just a comment header) — add one term per line (tool, product and brand names, jargon, words that get garbled); blank lines and lines starting with `#` are ignored. Edit it at any time while the app is running via the tray item **Otevřít glosář…** ("Open glossary"); changes apply to the next transcription, with no rebuild.
+- **Participant names.** The names of the people on the call are pulled automatically from the calendar invite, so the transcript spells them correctly.
+- **Per-meeting topic terms.** A few likely terms (product names, acronyms, codes) are also extracted automatically from the calendar event's description for that specific meeting.
+
 ## Installation
 
 ### Windows installer (recommended)
@@ -65,6 +73,8 @@ You can paste this URL into the dialog that appears on first run, or set it late
 > Keep this URL private — anyone who has it can read your entire calendar.
 
 Other settings live in `config.json` (see `config.example.json` for all keys and defaults), including the live and post-processing model names, polling interval, and the grace periods that control auto start/stop.
+
+The transcription glossary is a separate `glossary.txt` next to `config.json` (auto-created, starts empty, one term per line, `#` for comments). Edit it from the tray menu (**Otevřít glosář…**) — see [Transcription accuracy](#transcription-accuracy).
 
 ## Autostart
 

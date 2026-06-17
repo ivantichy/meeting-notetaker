@@ -13,6 +13,9 @@ models/
 # Lokální konfigurace — obsahuje TAJNOU ICS adresu kalendáře, necommitovat!
 config.json
 
+# Uživatelský slovník pro přepis (vzniká vedle config.json, soukromá data)
+glossary.txt
+
 # Logy
 notetaker.log
 

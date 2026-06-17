@@ -72,6 +72,14 @@ def main() -> int:
 
     cfg = load_config("config.json")
 
+    # Locator: zveřejni na PEVNÉ cestě (%LOCALAPPDATA%\MeetingNotetaker\
+    # app-info.json), kde leží poznámky tohoto běhu — ať skilly/tasky najdou
+    # přepisy bez ohledu na dev vs. nainstalovaný build. Plně defenzivní:
+    # selhání nikdy neshodí start.
+    from app.app_info import write_app_info
+
+    write_app_info(cfg)
+
     if not cfg.ics_url:
         url = IcsSetupDialog.get_url(None, initial="")
         if url:
