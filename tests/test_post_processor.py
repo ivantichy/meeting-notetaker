@@ -288,11 +288,16 @@ def test_merge_preserves_unrelated_sequence():
 
 
 def test_initial_prompt_includes_glossary_terms_and_attendees():
-    """Prompt obsahuje známé termíny i jména účastníků (email -> lokální část)."""
+    """Prompt obsahuje termíny ze slovníku i jména účastníků (email -> lokální
+    část). Vestavěný slovník neexistuje — termín zapíšeme do glossary.txt v cwd
+    (testy běží v izolovaném pracovním adresáři, viz _isolate_cwd fixture)."""
+    import pathlib
+
     from app.glossary import build_initial_prompt
 
+    pathlib.Path("glossary.txt").write_text("elem6\nKubernetes\n", encoding="utf-8")
     prompt = build_initial_prompt(["ivan@example.com", "Petr Novák"])
-    assert "Claude" in prompt
+    assert "Kubernetes" in prompt
     assert "elem6" in prompt
     assert "ivan" in prompt          # z e-mailu jen lokální část
     assert "Petr Novák" in prompt
@@ -309,12 +314,17 @@ def test_initial_prompt_deduplicates_case_insensitively():
 
 def test_default_transcribe_passes_multilingual_false_and_prompt():
     """_build_default_transcribe volá model.transcribe s multilingual=False,
-    vad_parameters a initial_prompt obsahujícím slovník (Claude)."""
+    vad_parameters a initial_prompt obsahujícím slovník (termín z glossary.txt)."""
+    import pathlib
     from unittest.mock import MagicMock
 
     import faster_whisper
 
     import app.post_processor as pp
+
+    # Vestavěný slovník neexistuje — termín zapíšeme do glossary.txt v cwd
+    # (testy běží v izolovaném pracovním adresáři, viz _isolate_cwd fixture).
+    pathlib.Path("glossary.txt").write_text("Kubernetes\n", encoding="utf-8")
 
     fake_model = MagicMock()
     fake_model.transcribe.return_value = ([], object())
@@ -330,7 +340,7 @@ def test_default_transcribe_passes_multilingual_false_and_prompt():
     _, kwargs = fake_model.transcribe.call_args
     assert kwargs["multilingual"] is False
     assert kwargs["language"] is None  # "auto" -> detekce jednou
-    assert "Claude" in kwargs["initial_prompt"]
+    assert "Kubernetes" in kwargs["initial_prompt"]  # termín z glossary.txt
     assert "Petr" in kwargs["initial_prompt"]
     assert kwargs["vad_parameters"]["min_speech_duration_ms"] == 250
     assert kwargs["vad_parameters"]["max_speech_duration_s"] == 30
@@ -364,6 +374,12 @@ def test_per_note_prompt_reflects_each_notes_names_not_cached_first(
     """KLÍČOVÉ: prompt se počítá per-note z DAT TÉ poznámky, ne z první
     zpracované schůzky. Dvě poznámky s různými účastníky -> různé prompty,
     přestože model (transcribe fn) je kešovaný napříč úkoly."""
+    import pathlib
+
+    # Termín do glossary.txt v cwd (vestavěný slovník neexistuje) — ověříme, že
+    # slovník je v obou per-note promptech. Testy běží v izolovaném cwd.
+    pathlib.Path("glossary.txt").write_text("Kubernetes\n", encoding="utf-8")
+
     store = NoteStore(tmp_notes_dir)
 
     # Dvě schůzky s různými jmény (CN -> attendee_names ve frontmatteru).
@@ -417,8 +433,8 @@ def test_per_note_prompt_reflects_each_notes_names_not_cached_first(
     # a NEobsahuje jméno té druhé schůzky (nezůstal zapečený prompt první)
     assert "Bob Bartoš" not in prompt_a
     assert "Alice Aldová" not in prompt_b
-    # slovník je v obou
-    assert "Claude" in prompt_a and "Claude" in prompt_b
+    # slovník (termín z glossary.txt) je v obou
+    assert "Kubernetes" in prompt_a and "Kubernetes" in prompt_b
 
 
 def test_read_note_prompt_data_prefers_names_falls_back_to_emails(

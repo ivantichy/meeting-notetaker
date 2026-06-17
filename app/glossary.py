@@ -2,16 +2,20 @@
 
 Whisper bere ``initial_prompt`` jako kontext (max ~224 tokenů; když ho překročí,
 faster-whisper si nechá POSLEDNÍ tokeny). Když do něj dáme správné tvary názvů,
-jmen a IT/AI termínů, model je přepisuje správně místo foneticky zkomolených
+jmen a termínů, model je přepisuje správně místo foneticky zkomolených
 verzí (např. elem6 -> "LM6", Claude -> "Klooda").
 
-DVĚ ÚROVNĚ SLOVNÍKU:
-  * vestavěné výchozí termíny ``GLOSSARY_TERMS`` (níž) — kompilují se do balíčku;
+ZDROJ SLOVNÍKU:
   * externí soubor ``glossary.txt`` v pracovním adresáři appky (tam, kde leží
-    ``config.json``) — ZDROJ PRAVDY, uživatel ho edituje ZA BĚHU bez buildu
-    (může termíny přidávat i MAZAT). Když chybí, vytvoří se předvyplněný
-    vestavěnými termíny. Vestavěné ``GLOSSARY_TERMS`` se do promptu NEpřimíchávají
-    natvrdo — jsou jen prvotní náplň souboru a fallback při chybě čtení.
+    ``config.json``) — JEDINÝ ZDROJ termínů. Uživatel ho edituje ZA BĚHU bez
+    buildu (termíny přidává i maže). Když chybí, vytvoří se PRÁZDNÝ (jen s českou
+    komentářovou hlavičkou) — žádné vestavěné termíny se nepředvyplňují.
+  * ``GLOSSARY_TERMS`` je schválně PRÁZDNÝ seznam: žádný vestavěný slovník není.
+    Termíny pocházejí pouze z ``glossary.txt`` a z jmen účastníků dané schůzky.
+
+Téma schůzky NENÍ zadrátované — ``BASE_PROMPT`` je neutrální a skutečné téma
+nese až NÁZEV schůzky z kalendáře (``build_initial_prompt`` ho připojí jako
+"Téma: <název>.").
 
 Prompt sestavujeme PER MEETING z jeho dat (jména účastníků + název) — ne globálně
 a ne zapečený do kešovaného modelu. Pořadí: úvodní věta + (název) na začátku,
@@ -25,10 +29,10 @@ import os
 
 log = logging.getLogger(__name__)
 
-#: Krátká uvozující věta promptu (udává jazyk/kontext). Schválně dvojjazyčná
-#: stručná nápověda — funguje pro češtinu i angličtinu (multilingual=False
-#: nechá Whisper detekovat jazyk jednou pro celé audio).
-BASE_PROMPT = "Přepis pracovního meetingu o IT a vývoji softwaru."
+#: Krátká uvozující věta promptu (udává kontext). Schválně TÉMATICKY NEUTRÁLNÍ —
+#: skutečné téma nese až NÁZEV schůzky z kalendáře, který ``build_initial_prompt``
+#: připojí jako "Téma: <název>." (nic o oboru/předmětu tu není zadrátováno).
+BASE_PROMPT = "Přepis schůzky."
 
 #: Název externího editovatelného slovníku (relativní k pracovnímu adresáři
 #: appky — main.py dělá chdir na kořen, takže to sedí v dev i v instalaci).
@@ -42,33 +46,22 @@ MAX_ATTENDEES = 12
 #: 1 token). Drženo pod ~224, ať se prompt celý vejde a neořeže se.
 MAX_PROMPT_WORDS = 200
 
-#: Vestavěný výchozí slovník správných tvarů názvů/termínů, které se v přepisech
-#: komolí. EDITOVAT ZA BĚHU lze v ``glossary.txt`` (vznikne předvyplněný tímto);
-#: tady je jen prvotní náplň ``glossary.txt`` + fallback při chybě čtení.
-GLOSSARY_TERMS: list[str] = [
-    "elem6",
-    "Unicorn",
-    "Claude",
-    "Codex",
-    "hooks",
-    "PowerShell",
-    "React",
-    "faster-whisper",
-    "Whisper",
-    "GitHub",
-    "Python",
-    "Cowork",
-    "MCP",
-    "Anthropic",
-]
+#: Schválně PRÁZDNÝ — žádný vestavěný slovník neexistuje. Termíny pocházejí jen
+#: z editovatelného ``glossary.txt`` (zdroj pravdy) a ze jmen účastníků schůzky.
+#: Konstanta zůstává kvůli kompatibilitě: je to prvotní náplň nového souboru
+#: (žádná) i fallback při chybě čtení (prázdný seznam = bez termínů; přijatelné).
+GLOSSARY_TERMS: list[str] = []
 
-#: Komentářová hlavička, kterou předvyplníme nově vytvořený ``glossary.txt``.
+#: Komentářová hlavička nově vytvořeného ``glossary.txt``. Soubor vzniká PRÁZDNÝ
+#: (jen tato hlavička, žádné předvyplněné termíny) — naplní si ho uživatel.
 _GLOSSARY_FILE_HEADER = (
     "# Slovník pro přepis (Whisper initial_prompt) — kvalita rozpoznání jmen a termínů.\n"
     "# Jeden termín na řádek. Prázdné řádky a řádky začínající '#' se ignorují.\n"
-    "# Sem patří názvy nástrojů, značky, AI modely a slova, která se v přepisu komolí.\n"
+    "# Soubor začíná prázdný — žádné termíny nejsou předvyplněné, naplňte si ho sami.\n"
+    "# Sem patří názvy nástrojů/produktů/značek, žargon a slova, která se v přepisu\n"
+    "# komolí; případně jména kolegů, se kterými se často potkáváte.\n"
     "# Soubor lze editovat za běhu — změny se projeví u dalšího přepisu (není nutný\n"
-    "# nový build). Jména účastníků meetingu se doplňují automaticky z kalendáře.\n"
+    "# nový build). Jména účastníků schůzky se doplňují automaticky z kalendáře.\n"
     "# Prompt držte krátký (~224 tokenů je strop Whisperu).\n"
 )
 
@@ -79,11 +72,12 @@ def _glossary_path() -> str:
 
 
 def ensure_glossary_file(path: "str | None" = None) -> str:
-    """Zajistí existenci ``glossary.txt`` — když chybí, vytvoří ho předvyplněný
-    vestavěnými termíny + českou komentářovou hlavičkou. Vrací použitou cestu.
+    """Zajistí existenci ``glossary.txt`` — když chybí, vytvoří ho PRÁZDNÝ (jen
+    s českou komentářovou hlavičkou; ``GLOSSARY_TERMS`` je prázdný, takže se
+    žádné termíny nezapisují). Vrací použitou cestu.
 
     Chybu zápisu jen zaloguje (přepis ani UI nesmí kvůli ní spadnout) — slovník
-    se pak prostě bere jen z vestavěných ``GLOSSARY_TERMS``.
+    pak prostě zůstane prázdný (žádné termíny).
     """
     p = path or _glossary_path()
     if os.path.exists(p):
@@ -100,11 +94,11 @@ def ensure_glossary_file(path: "str | None" = None) -> str:
 
 
 def _load_glossary_terms(path: "str | None" = None) -> list[str]:
-    """Načte termíny z ``glossary.txt`` (vytvoří ho předvyplněný, když chybí).
-    Soubor je ZDROJ PRAVDY — vestavěné ``GLOSSARY_TERMS`` slouží jen jako prvotní
-    náplň nového souboru a jako fallback při chybě čtení; nepřimíchávají se natvrdo,
-    takže uživatel může termíny i mazat. Prázdné řádky a ``#`` komentáře ignoruje,
-    deduplikuje case-insensitivně (pořadí zachová). Chyba čtení -> vestavěné termíny.
+    """Načte termíny z ``glossary.txt`` (vytvoří ho prázdný, když chybí).
+    Soubor je JEDINÝ ZDROJ termínů — vestavěný slovník neexistuje
+    (``GLOSSARY_TERMS`` je prázdný), takže uživatel termíny libovolně přidává i
+    maže. Prázdné řádky a ``#`` komentáře ignoruje, deduplikuje case-insensitivně
+    (pořadí zachová). Chyba čtení -> prázdný seznam (bez termínů; přijatelné).
     """
     p = path or _glossary_path()
     try:
@@ -112,7 +106,7 @@ def _load_glossary_terms(path: "str | None" = None) -> list[str]:
         with open(p, "r", encoding="utf-8") as f:
             raw_lines = f.readlines()
     except OSError:
-        log.exception("Čtení %s selhalo — používám vestavěný slovník.", p)
+        log.exception("Čtení %s selhalo — slovník zůstane prázdný.", p)
         return list(GLOSSARY_TERMS)
 
     file_terms: list[str] = []
@@ -122,8 +116,8 @@ def _load_glossary_terms(path: "str | None" = None) -> list[str]:
             continue
         file_terms.append(term)
 
-    # Soubor je ZDROJ PRAVDY (vestavěné termíny do něj jen prvotně nasázíme přes
-    # ensure_glossary_file), takže uživatel může termíny i MAZAT. Dedup case-insens.
+    # Soubor je JEDINÝ ZDROJ termínů (žádný vestavěný slovník), takže uživatel
+    # termíny libovolně přidává i MAZAT. Dedup case-insens.
     return _dedup_preserve_order(file_terms)
 
 
@@ -168,8 +162,8 @@ def build_initial_prompt(
 
     ``attendees`` jsou jména/e-maily účastníků meetingu (z kalendáře u živého
     přepisu, z frontmatteru u finálního; e-mail -> lokální část). ``title`` je
-    název schůzky (volitelně). Slovník se načte čerstvě z ``glossary.txt``
-    (zdroj pravdy; vestavěné termíny jen jako prvotní náplň souboru + fallback).
+    název schůzky z kalendáře (volitelně) — nese skutečné téma. Slovník se načte
+    čerstvě z ``glossary.txt`` (jediný zdroj termínů, žádný vestavěný slovník).
 
     Token budget: jména cápneme na ``MAX_ATTENDEES`` a celý prompt na zhruba
     ``MAX_PROMPT_WORDS`` slov — slovník přitom NIKDY nevypadne kvůli dlouhému

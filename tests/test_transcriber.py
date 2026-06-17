@@ -66,7 +66,13 @@ def test_processes_chunk_applies_offset(cfg):
 
 def test_live_transcribe_uses_multilingual_false_and_prompt_with_attendees(cfg):
     """Živý přepis volá model.transcribe s multilingual=False a initial_prompt,
-    který obsahuje slovník (Claude) i jména účastníků předaná transcriberu."""
+    který obsahuje slovník (z glossary.txt) i jména účastníků předaná transcriberu."""
+    # Vestavěný slovník neexistuje — termín si zapíšeme do glossary.txt v cwd
+    # (testy běží v izolovaném pracovním adresáři, viz _isolate_cwd fixture).
+    import pathlib
+
+    pathlib.Path("glossary.txt").write_text("Kubernetes\n", encoding="utf-8")
+
     captured = {}
 
     class CapturingModel(FakeModel):
@@ -87,7 +93,7 @@ def test_live_transcribe_uses_multilingual_false_and_prompt_with_attendees(cfg):
 
     assert captured["multilingual"] is False
     assert captured["language"] == "cs"  # konkrétní kód z configu
-    assert "Claude" in captured["initial_prompt"]
+    assert "Kubernetes" in captured["initial_prompt"]  # termín z glossary.txt
     assert "Petr Novák" in captured["initial_prompt"]
     assert "ivan" in captured["initial_prompt"]  # e-mail -> lokální část
     assert captured["vad_parameters"]["min_speech_duration_ms"] == 250
