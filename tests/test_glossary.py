@@ -43,18 +43,18 @@ def test_build_prompt_creates_file_on_demand(tmp_path):
     assert "Claude" in prompt  # vestavěný termín v promptu
 
 
-def test_file_terms_merge_with_builtins_and_dedup(tmp_path):
-    """Termíny ze souboru se SLOUČÍ s vestavěnými; case-insensitivní dedup."""
+def test_file_is_source_of_truth_terms_removable(tmp_path):
+    """Soubor je ZDROJ PRAVDY: vestavěné se nepřimíchávají natvrdo, takže termín
+    v souboru vynechaný se v promptu neobjeví (jdou mazat). Case-insens. dedup."""
     p = _gp(tmp_path)
-    # 'claude' je duplicita vestavěného 'Claude' (jiná velikost) -> jen jednou;
-    # 'Kubernetes' je nový -> objeví se.
+    # Soubor BEZ vestavěného 'elem6'; 'claude'/'Claude' duplicita; 'Kubernetes' nový.
     (tmp_path / "glossary.txt").write_text(
-        "claude\nKubernetes\n", encoding="utf-8"
+        "claude\nClaude\nKubernetes\n", encoding="utf-8"
     )
     prompt = build_initial_prompt([], glossary_path=p)
-    assert "Kubernetes" in prompt           # nový termín ze souboru
+    assert "Kubernetes" in prompt               # termín ze souboru
     assert prompt.lower().count("claude") == 1  # dedup case-insensitive
-    assert "elem6" in prompt                # vestavěný stále přítomen
+    assert "elem6" not in prompt                # vestavěný NENÍ natvrdo přimíchán
 
 
 def test_blank_lines_and_comments_ignored(tmp_path):

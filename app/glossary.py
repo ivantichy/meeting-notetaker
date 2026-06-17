@@ -8,10 +8,10 @@ verzí (např. elem6 -> "LM6", Claude -> "Klooda").
 DVĚ ÚROVNĚ SLOVNÍKU:
   * vestavěné výchozí termíny ``GLOSSARY_TERMS`` (níž) — kompilují se do balíčku;
   * externí soubor ``glossary.txt`` v pracovním adresáři appky (tam, kde leží
-    ``config.json``) — uživatel ho může editovat ZA BĚHU bez nového buildu.
-    Když chybí, vytvoří se předvyplněný vestavěnými termíny. Při sestavování
-    promptu se oba zdroje načtou a sloučí (case-insensitive deduplikace,
-    pořadí zachováno). Chyba čtení souboru -> tiše padáme na vestavěné termíny.
+    ``config.json``) — ZDROJ PRAVDY, uživatel ho edituje ZA BĚHU bez buildu
+    (může termíny přidávat i MAZAT). Když chybí, vytvoří se předvyplněný
+    vestavěnými termíny. Vestavěné ``GLOSSARY_TERMS`` se do promptu NEpřimíchávají
+    natvrdo — jsou jen prvotní náplň souboru a fallback při chybě čtení.
 
 Prompt sestavujeme PER MEETING z jeho dat (jména účastníků + název) — ne globálně
 a ne zapečený do kešovaného modelu. Pořadí: úvodní věta + (název) na začátku,
@@ -44,7 +44,7 @@ MAX_PROMPT_WORDS = 200
 
 #: Vestavěný výchozí slovník správných tvarů názvů/termínů, které se v přepisech
 #: komolí. EDITOVAT ZA BĚHU lze v ``glossary.txt`` (vznikne předvyplněný tímto);
-#: tady je vestavěný základ, na který se vždy dá spolehnout (i v balíčku).
+#: tady je jen prvotní náplň ``glossary.txt`` + fallback při chybě čtení.
 GLOSSARY_TERMS: list[str] = [
     "elem6",
     "Unicorn",
@@ -100,10 +100,11 @@ def ensure_glossary_file(path: "str | None" = None) -> str:
 
 
 def _load_glossary_terms(path: "str | None" = None) -> list[str]:
-    """Načte termíny z ``glossary.txt`` (vytvoří ho, když chybí) a sloučí je s
-    vestavěnými ``GLOSSARY_TERMS``. Prázdné řádky a ``#`` komentáře ignoruje,
-    deduplikuje case-insensitivně (pořadí zachová: nejdřív vestavěné, pak nové
-    ze souboru). Jakákoli chyba čtení -> padáme na vestavěné termíny.
+    """Načte termíny z ``glossary.txt`` (vytvoří ho předvyplněný, když chybí).
+    Soubor je ZDROJ PRAVDY — vestavěné ``GLOSSARY_TERMS`` slouží jen jako prvotní
+    náplň nového souboru a jako fallback při chybě čtení; nepřimíchávají se natvrdo,
+    takže uživatel může termíny i mazat. Prázdné řádky a ``#`` komentáře ignoruje,
+    deduplikuje case-insensitivně (pořadí zachová). Chyba čtení -> vestavěné termíny.
     """
     p = path or _glossary_path()
     try:
@@ -121,8 +122,9 @@ def _load_glossary_terms(path: "str | None" = None) -> list[str]:
             continue
         file_terms.append(term)
 
-    # Vestavěné mají přednost v pořadí; soubor doplní zbytek. Dedup case-insens.
-    return _dedup_preserve_order(list(GLOSSARY_TERMS) + file_terms)
+    # Soubor je ZDROJ PRAVDY (vestavěné termíny do něj jen prvotně nasázíme přes
+    # ensure_glossary_file), takže uživatel může termíny i MAZAT. Dedup case-insens.
+    return _dedup_preserve_order(file_terms)
 
 
 def _dedup_preserve_order(items: "list[str]") -> list[str]:
@@ -167,7 +169,7 @@ def build_initial_prompt(
     ``attendees`` jsou jména/e-maily účastníků meetingu (z kalendáře u živého
     přepisu, z frontmatteru u finálního; e-mail -> lokální část). ``title`` je
     název schůzky (volitelně). Slovník se načte čerstvě z ``glossary.txt``
-    (sloučený s vestavěnými termíny).
+    (zdroj pravdy; vestavěné termíny jen jako prvotní náplň souboru + fallback).
 
     Token budget: jména cápneme na ``MAX_ATTENDEES`` a celý prompt na zhruba
     ``MAX_PROMPT_WORDS`` slov — slovník přitom NIKDY nevypadne kvůli dlouhému
