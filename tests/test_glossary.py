@@ -11,8 +11,10 @@ from app.glossary import (
     BASE_PROMPT,
     GLOSSARY_TERMS,
     MAX_ATTENDEES,
+    MAX_TOPIC_TERMS,
     build_initial_prompt,
     ensure_glossary_file,
+    extract_topic_terms,
 )
 
 
@@ -162,3 +164,147 @@ def test_no_attendees_no_title_empty_glossary_is_base_only(tmp_path):
     assert prompt == BASE_PROMPT
     assert "Termíny a jména:" not in prompt
     assert "Téma:" not in prompt  # bez názvu
+
+
+# ----------------------------------------------- extract_topic_terms (B)
+
+
+class TestExtractTopicTerms:
+    """Lokální deterministická extrakce 'identifikátorových' termínů z názvu +
+    popisu schůzky. Precision over recall: radši termín vynechá, než aby vnesl
+    falešný bias do Whisperu."""
+
+    def test_recognizes_camelcase(self):
+        terms = extract_topic_terms("Migrace na PowerShell", "Nasadíme GitHub Actions")
+        assert "PowerShell" in terms
+        assert "GitHub" in terms
+
+    def test_recognizes_letter_digit_tokens(self):
+        terms = extract_topic_terms("Integrace elem6", "Vyzkoušíme GPT-4 model")
+        assert "elem6" in terms
+        assert "GPT-4" in terms
+
+    def test_recognizes_allcaps_acronyms(self):
+        terms = extract_topic_terms("MCP server", "Napojení na CRM a API")
+        assert "MCP" in terms
+        assert "CRM" in terms
+        assert "API" in terms
+
+    def test_rejects_plain_words(self):
+        """Obyčejná malá i Kapitalizovaná slova (česká věta) se neberou."""
+        terms = extract_topic_terms(
+            "Plánování sprintu", "Probereme rozpočet a termíny dodávky"
+        )
+        # žádné běžné slovo (malé ani s velkým prvním písmenem) neprošlo
+        assert terms == []
+
+    def test_rejects_dates_times_versions_numbers(self):
+        """2026, 16:00, v1.2.3, 10x i čistá čísla se zahodí (i přes písmeno+číslici)."""
+        terms = extract_topic_terms(
+            "Schůzka 2026",
+            "Začátek v 16:00, verze v1.2.3, zrychlení 10x, kapacita 12345",
+        )
+        for bad in ("2026", "16:00", "v1.2.3", "10x", "12345"):
+            assert bad not in terms
+        assert terms == []  # nic z toho nekvalifikuje
+
+    def test_dedup_case_insensitive(self):
+        terms = extract_topic_terms("PowerShell powershell PowerShell", "GitHub github")
+        # case-insens. dedup -> každý termín jednou
+        assert len(terms) == len([t for t in terms])
+        lowered = [t.casefold() for t in terms]
+        assert lowered.count("powershell") == 1
+        assert lowered.count("github") == 1
+
+    def test_caps_at_max_topic_terms(self):
+        many = " ".join(f"Foo{i}Bar" for i in range(MAX_TOPIC_TERMS + 10))
+        terms = extract_topic_terms(many, "")
+        assert len(terms) == MAX_TOPIC_TERMS
+
+    def test_empty_inputs_yield_empty(self):
+        assert extract_topic_terms("", "") == []
+        assert extract_topic_terms(None, None) == []  # type: ignore[arg-type]
+
+
+# --------------------------------------- build_initial_prompt + topic_terms
+
+
+def test_topic_terms_appear_in_prompt_head_context(tmp_path):
+    """topic_terms se objeví v promptu jako 'Kontext: …' v HLAVĚ (za názvem,
+    PŘED chráněným koncem se slovníkem a jmény)."""
+    p = _gp(tmp_path)
+    (tmp_path / "glossary.txt").write_text("Kubernetes\n", encoding="utf-8")
+    prompt = build_initial_prompt(
+        ["Petr Novák"],
+        title="Plánování",
+        glossary_path=p,
+        topic_terms=["PowerShell", "elem6"],
+    )
+    assert "Kontext:" in prompt
+    assert "PowerShell" in prompt
+    assert "elem6" in prompt
+    # pořadí: Téma -> Kontext (termíny) -> Termíny a jména (slovník + jména)
+    i_title = prompt.index("Plánování")
+    i_context = prompt.index("Kontext:")
+    i_tail = prompt.index("Termíny a jména:")
+    assert i_title < i_context < i_tail
+    # termíny jsou v hlavě (před chráněným koncem)
+    assert prompt.index("PowerShell") < i_tail
+    # slovník i jméno jsou na chráněném konci
+    assert prompt.index("Kubernetes") > i_tail
+    assert prompt.index("Petr Novák") > i_tail
+
+
+def test_topic_terms_deduped_against_glossary_and_names(tmp_path):
+    """topic_terms se nezdvojí proti slovníku ani jménům (ta jsou důvěryhodnější,
+    zůstávají na konci; z hlavy se duplicita vyhodí)."""
+    p = _gp(tmp_path)
+    (tmp_path / "glossary.txt").write_text("Kubernetes\n", encoding="utf-8")
+    prompt = build_initial_prompt(
+        ["PowerShell"],  # jméno shodné s termínem
+        glossary_path=p,
+        topic_terms=["Kubernetes", "PowerShell", "elem6"],
+    )
+    # Kubernetes (slovník) a PowerShell (jméno) zůstávají jen na konci, ne v Kontextu
+    head = prompt.split("Termíny a jména:")[0]
+    assert "Kubernetes" not in head
+    assert "PowerShell" not in head
+    # elem6 (jen v topic_terms) je v hlavě jako kontext
+    assert "elem6" in head
+    # každý se vyskytuje právě jednou
+    assert prompt.count("Kubernetes") == 1
+    assert prompt.count("PowerShell") == 1
+
+
+def test_over_budget_trims_topic_terms_before_glossary_and_names(tmp_path):
+    """Při překročení rozpočtu se OŘÍZNOU tematické termíny (hlava) DŘÍV než
+    slovník a jména (chráněný konec, který si Whisper nechá)."""
+    p = _gp(tmp_path)
+    (tmp_path / "glossary.txt").write_text("DulezityTermin\n", encoding="utf-8")
+    # Spousta tematických termínů (každý projde filtrem: CamelCase) -> přetečou
+    # rozpočet a musí padnout jako první. MAX_TOPIC_TERMS jich omezí na 8, tak
+    # je doplníme dlouhým názvem, ať hlava nafoukne prompt přes word budget.
+    long_title = " ".join(f"VelmiDlouhyKontextovyTermin{i}" for i in range(300))
+    prompt = build_initial_prompt(
+        ["DuleziteJmeno"],
+        title=long_title,
+        glossary_path=p,
+        topic_terms=["KontextovyTermin1", "KontextovyTermin2"],
+    )
+    # chráněný konec (slovník + jméno) přežil ořez
+    assert "DulezityTermin" in prompt
+    assert "DuleziteJmeno" in prompt
+    # hlava (název/kontext) byla ořezána -> termíny z hlavy zmizely
+    assert "VelmiDlouhyKontextovyTermin0" not in prompt
+    # prompt nepřeroste hrubý word budget o moc
+    assert len(prompt.split()) <= 210
+
+
+def test_no_topic_terms_behaves_as_before(tmp_path):
+    """Bez topic_terms (ruční záznam) je prompt jako dřív — žádná sekce Kontext."""
+    p = _gp(tmp_path)
+    (tmp_path / "glossary.txt").write_text("Kubernetes\n", encoding="utf-8")
+    prompt = build_initial_prompt(["Petr"], title="Porada", glossary_path=p)
+    assert "Kontext:" not in prompt
+    assert "Kubernetes" in prompt
+    assert "Petr" in prompt

@@ -299,3 +299,75 @@ def test_device_error_callback_propagates(recorder, holder, meeting):
     holder.capture.on_device_error("Zvukové zařízení selhalo (mikrofon): test")
     assert seen == ["Zvukové zařízení selhalo (mikrofon): test"]
     recorder.stop()
+
+
+# ----------------------------------- B: tematické termíny do živého přepisu
+
+
+class _KwTranscriber(FakeTranscriber):
+    """Transcriber, který přijme kwargs attendees/title/topic_terms a uloží je
+    (mirror reálného Transcriberu) — ověříme, co recorder předá."""
+
+    def __init__(self, cfg, on_segments, attendees=None, title=None, topic_terms=None):
+        super().__init__(cfg, on_segments)
+        self.attendees = list(attendees or [])
+        self.title = title
+        self.topic_terms = list(topic_terms or [])
+
+
+def test_live_recorder_passes_topic_terms_to_transcriber(cfg, store):
+    """Živý přepis: recorder vytěží tematické termíny z názvu + popisu schůzky
+    a předá je Transcriberu (kvalitnější přepis názvů)."""
+    captured = {}
+
+    def transcriber_factory(cfg_, on_segments, **kw):
+        tr = _KwTranscriber(cfg_, on_segments, **kw)
+        captured["tr"] = tr
+        return tr
+
+    rec = Recorder(
+        cfg, store,
+        capture_factory=lambda c, on_chunk: FakeCapture(c, on_chunk),
+        transcriber_factory=transcriber_factory,
+    )
+    start = datetime(2026, 6, 12, 13, 30).astimezone()
+    m = Meeting(
+        uid="topic-1::x",
+        title="Migrace na PowerShell",
+        start=start,
+        end=start + timedelta(hours=1),
+        platform=Platform.MEET,
+        attendees=["ivan@example.com"],
+        description="Nasadíme GitHub a elem6, napojíme MCP server.",
+    )
+    rec.start(m)
+    tr = captured["tr"]
+    # termíny z názvu + popisu dorazily do transcriberu
+    assert "PowerShell" in tr.topic_terms
+    assert "GitHub" in tr.topic_terms
+    assert "elem6" in tr.topic_terms
+    assert "MCP" in tr.topic_terms
+    # jména a název se předávají dál jako dřív
+    assert tr.title == "Migrace na PowerShell"
+    rec.stop()
+
+
+def test_manual_recording_has_empty_topic_terms(cfg, store):
+    """Ruční záznam (syntetická schůzka bez popisu) -> žádné tematické termíny,
+    chování jako dřív (jen base + slovník)."""
+    captured = {}
+
+    def transcriber_factory(cfg_, on_segments, **kw):
+        tr = _KwTranscriber(cfg_, on_segments, **kw)
+        captured["tr"] = tr
+        return tr
+
+    rec = Recorder(
+        cfg, store,
+        capture_factory=lambda c, on_chunk: FakeCapture(c, on_chunk),
+        transcriber_factory=transcriber_factory,
+    )
+    rec.start_manual()
+    tr = captured["tr"]
+    assert tr.topic_terms == []  # "Ruční záznam" -> žádné identifikátory
+    rec.stop()

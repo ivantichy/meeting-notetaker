@@ -26,6 +26,30 @@ class CalendarError(Exception):
     tokenu; tu nesmíme nikdy pustit do status baru ani do notetaker.log.
     """
 
+#: Strop délky vyčištěného popisu události (znaky). Popis slouží jen jako zdroj
+#: tematických termínů do promptu — delší text nic nepřidá a jen by se tahal v
+#: paměti / frontmatteru.
+MAX_DESCRIPTION_CHARS = 800
+
+# URL (http/https) — z popisu pryč (jen šum pro extrakci termínů).
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+# E-mailová adresa — pryč (osobní údaj + šum).
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+# Telefonní číslo (mezinárodní i místní, mezery/pomlčky/závorky) — pryč.
+_PHONE_RE = re.compile(r"(?<!\w)\+?\d[\d\s().\-]{6,}\d(?!\w)")
+# Řádky typické pro pozvánky na schůzku (boilerplate). Case-insensitive, stačí
+# výskyt fráze kdekoli na řádku -> celý řádek zahodíme.
+_BOILERPLATE_LINE_RE = re.compile(
+    r"(join\s+microsoft\s+teams|microsoft\s+teams\s+meeting"
+    r"|join\s+zoom\s+meeting|zoom\s+meeting"
+    r"|join\s+on\s+your\s+computer|click\s+here\s+to\s+join"
+    r"|meeting\s+id\s*:|passcode\s*:|dial[\s\-]?in|phone\s+conference"
+    r"|one\s+tap\s+mobile|find\s+a\s+local\s+number|conference\s+id"
+    r"|připojit\s+se|připojte\s+se|id\s+schůzky|kód\s+(?:pro\s+)?připojení"
+    r"|learn\s+more|________+|------+|======+|\*\*\*\*\*+)",
+    re.IGNORECASE,
+)
+
 # meet.google.com/abc-defg-hij (+ případné query parametry)
 _MEET_RE = re.compile(r"https?://meet\.google\.com/[A-Za-z0-9\-._]+(?:\?[^\s<>\"']*)?")
 # teams.microsoft.com/l/meetup-join/... nebo teams.live.com/...
@@ -144,6 +168,45 @@ def _attendees_and_names(event) -> "tuple[list[str], list[str]]":
     return emails, names
 
 
+def _clean_description(event) -> str:
+    """Vytáhne a vyčistí ``DESCRIPTION`` události na zdroj tematických termínů.
+
+    Z popisu odstraní URL, e-maily, telefonní čísla a celé řádky s boilerplate
+    pozvánek na schůzku (Join Microsoft Teams Meeting, Zoom dial-in, oddělovací
+    čáry apod.), pak sjednotí mezery a ořízne na ``MAX_DESCRIPTION_CHARS`` znaků.
+    Chybějící popis -> ``""``. Čistě defenzivní (kalendář nesmí kvůli popisu
+    spadnout) — vrací řetězec, nikdy nevyhazuje.
+    """
+    value = event.get("DESCRIPTION")
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        raw = " ".join(str(v) for v in value)
+    else:
+        raw = str(value)
+    if not raw.strip():
+        return ""
+
+    # 1) po řádcích zahodit boilerplate (Teams/Zoom/dial-in/oddělovače).
+    kept_lines: "list[str]" = []
+    for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if _BOILERPLATE_LINE_RE.search(line):
+            continue
+        kept_lines.append(line)
+    text = " ".join(kept_lines)
+
+    # 2) odstranit URL / e-maily / telefony (osobní údaje + šum pro extrakci).
+    text = _URL_RE.sub(" ", text)
+    text = _EMAIL_RE.sub(" ", text)
+    text = _PHONE_RE.sub(" ", text)
+
+    # 3) sjednotit bílé znaky a oříznout délku.
+    text = " ".join(text.split())
+    if len(text) > MAX_DESCRIPTION_CHARS:
+        text = text[:MAX_DESCRIPTION_CHARS].rstrip()
+    return text
+
+
 def parse_meetings(ics_text: str, window_days: int = 7) -> "list[Meeting]":
     """Expand recurring events (recurring_ical_events) from now-12h to now+window_days.
 
@@ -185,6 +248,7 @@ def parse_meetings(ics_text: str, window_days: int = 7) -> "list[Meeting]":
             ics_uid = str(event.get("UID", ""))
             title = str(event.get("SUMMARY", "")) or "Bez názvu"
             emails, names = _attendees_and_names(event)
+            description = _clean_description(event)
 
             meetings.append(
                 Meeting(
@@ -196,6 +260,7 @@ def parse_meetings(ics_text: str, window_days: int = 7) -> "list[Meeting]":
                     join_url=join_url,
                     attendees=emails,
                     attendee_names=names,
+                    description=description,
                 )
             )
         except Exception:  # noqa: BLE001 - přeskočit vadnou událost, ostatní zpracovat

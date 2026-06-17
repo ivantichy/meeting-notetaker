@@ -107,6 +107,7 @@ class Transcriber:
         model_factory: "Callable[[], object] | None" = None,
         attendees: "list[str] | None" = None,
         title: "str | None" = None,
+        topic_terms: "list[str] | None" = None,
     ):
         self._cfg = cfg
         self._on_segments = on_segments
@@ -116,6 +117,10 @@ class Transcriber:
         self._attendees = list(attendees or [])
         #: Název schůzky — jde do initial_prompt jako kontext tématu (volitelně).
         self._title = (title or "").strip()
+        #: Tematické termíny vytěžené z popisu/názvu schůzky — jdou do HLAVY
+        #: initial_prompt jako kontext (nejméně důvěryhodné, smí padnout první).
+        #: Prázdné u ručního záznamu nebo když je Recorder nepředá.
+        self._topic_terms = list(topic_terms or [])
         #: Voláno (z vlákna start()) při neúspěšném načtení modelu — UI to má
         #: tvrdě ohlásit místo nekonečného opakování po blocích (H1).
         self._on_error = on_error or (lambda msg: None)
@@ -271,7 +276,9 @@ class Transcriber:
             vad_parameters=dict(min_speech_duration_ms=250, max_speech_duration_s=30),
             beam_size=1,
             condition_on_previous_text=False,
-            initial_prompt=build_initial_prompt(self._attendees, title=self._title),
+            initial_prompt=build_initial_prompt(
+                self._attendees, title=self._title, topic_terms=self._topic_terms
+            ),
         )
         out: list[tuple[float, float, str]] = []
         for seg in segments:

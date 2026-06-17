@@ -30,10 +30,14 @@ def _default_capture_factory(cfg, on_chunk):
     return AudioCapture(cfg, on_chunk)
 
 
-def _default_transcriber_factory(cfg, on_segments, attendees=None, title=None):
+def _default_transcriber_factory(
+    cfg, on_segments, attendees=None, title=None, topic_terms=None
+):
     from app.transcriber import Transcriber
 
-    return Transcriber(cfg, on_segments, attendees=attendees, title=title)
+    return Transcriber(
+        cfg, on_segments, attendees=attendees, title=title, topic_terms=topic_terms
+    )
 
 
 class Recorder:
@@ -109,12 +113,19 @@ class Recorder:
                 )
 
             path = self._store.create_note(meeting)
-            # Účastníky + název meetingu předáme transcriberu pro initial_prompt
-            # slovník (lepší přepis jmen). Preferujeme zobrazovaná jména (CN z
-            # kalendáře); když chybí, padáme na e-maily. Fake factories v testech
-            # berou jen 2 argumenty — pak je vynecháme (zpětná kompatibilita).
+            # Účastníky + název + tematické termíny meetingu předáme transcriberu
+            # pro initial_prompt (lepší přepis jmen i názvů). Preferujeme
+            # zobrazovaná jména (CN z kalendáře); když chybí, padáme na e-maily.
+            # Tematické termíny vytěžíme lokálně z názvu + popisu (deterministicky,
+            # bez LLM); ruční záznam nemá popis -> prázdné. Fake factories v
+            # testech berou jen 2 argumenty — pak je vynecháme (zpětná kompat).
             prompt_names = (
                 getattr(meeting, "attendee_names", None) or meeting.attendees
+            )
+            from app.glossary import extract_topic_terms
+
+            topic_terms = extract_topic_terms(
+                meeting.title, getattr(meeting, "description", "") or ""
             )
             try:
                 transcriber = self._transcriber_factory(
@@ -122,6 +133,7 @@ class Recorder:
                     self._handle_segments,
                     attendees=prompt_names,
                     title=meeting.title,
+                    topic_terms=topic_terms,
                 )
             except TypeError:
                 transcriber = self._transcriber_factory(self._cfg, self._handle_segments)

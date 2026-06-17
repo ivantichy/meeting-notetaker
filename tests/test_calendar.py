@@ -50,6 +50,74 @@ class TestSingleMeetEvent:
         assert m.attendees == ["ivan@example.com", "petr@example.com"]
 
 
+class TestDescription:
+    """DESCRIPTION se naparsuje do Meeting.description a vyčistí (URL/e-mail/
+    telefon/boilerplate pryč); chybějící popis -> ""."""
+
+    def _z(self, dt):
+        from datetime import timezone
+
+        return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    def _event_with_description(self, now, description: str) -> str:
+        start = now + timedelta(hours=1)
+        # DESCRIPTION s ICS escapem \n pro víceřádkový text (boilerplate).
+        return "\n".join(
+            [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                "PRODID:-//test//x//CS",
+                "BEGIN:VEVENT",
+                "UID:desc-1@example.com",
+                f"DTSTART:{self._z(start)}",
+                f"DTEND:{self._z(start + timedelta(hours=1))}",
+                "SUMMARY:Schůzka s popisem",
+                f"DESCRIPTION:{description}",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ]
+        )
+
+    def test_description_parsed_and_cleaned(self, now_local):
+        # Popis s boilerplate řádkem, URL, e-mailem a telefonem + užitečný text.
+        desc = (
+            "Probereme migraci na PowerShell a elem6.\\n"
+            "________________________________________________________________________________\\n"
+            "Join Microsoft Teams Meeting\\n"
+            "https://teams.microsoft.com/l/meetup-join/abc\\n"
+            "Kontakt: ivan@example.com nebo +420 777 123 456"
+        )
+        (m,) = parse_meetings(self._event_with_description(now_local, desc))
+        # užitečný text zůstal
+        assert "PowerShell" in m.description
+        assert "elem6" in m.description
+        # boilerplate / URL / e-mail / telefon pryč
+        assert "Join Microsoft Teams" not in m.description
+        assert "teams.microsoft.com" not in m.description
+        assert "http" not in m.description
+        assert "ivan@example.com" not in m.description
+        assert "777 123 456" not in m.description
+        assert "______" not in m.description
+        # whitespace sjednocen (žádné dvojité mezery)
+        assert "  " not in m.description
+
+    def test_missing_description_is_empty_string(self, now_local):
+        (m,) = parse_meetings(self._event_with_description(now_local, ""))
+        assert m.description == ""
+
+    def test_event_without_description_key_is_empty(self, ics_no_link):
+        # _no_link_event nemá DESCRIPTION vůbec -> "".
+        (m,) = parse_meetings(ics_no_link)
+        assert m.description == ""
+
+    def test_long_description_capped(self, now_local):
+        from app.calendar_ics import MAX_DESCRIPTION_CHARS
+
+        long = "PlatnyToken " * 500  # >> MAX_DESCRIPTION_CHARS
+        (m,) = parse_meetings(self._event_with_description(now_local, long))
+        assert len(m.description) <= MAX_DESCRIPTION_CHARS
+
+
 class TestAttendeeNamesFallback:
     """CN -> attendee_names; chybějící CN -> lokální část e-mailu."""
 

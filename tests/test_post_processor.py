@@ -447,7 +447,7 @@ def test_read_note_prompt_data_prefers_names_falls_back_to_emails(
     m1 = make_meeting(fixed_now, title="S CN", attendees=["x@a.cz"])
     m1.attendee_names = ["Jana Nováková"]
     p1 = store.create_note(m1)
-    names1, title1 = PostProcessor._read_note_prompt_data(p1)
+    names1, title1, _terms1 = PostProcessor._read_note_prompt_data(p1)
     assert names1 == ["Jana Nováková"]
     assert title1 == "S CN"
 
@@ -457,6 +457,66 @@ def test_read_note_prompt_data_prefers_names_falls_back_to_emails(
     )
     # nesimulujeme attendee_names (zůstane prázdné [])
     p2 = store.create_note(m2)
-    names2, title2 = PostProcessor._read_note_prompt_data(p2)
+    names2, title2, _terms2 = PostProcessor._read_note_prompt_data(p2)
     assert names2 == ["karel@a.cz"]
     assert title2 == "Bez CN"
+
+
+def test_read_note_prompt_data_returns_topic_terms(
+    tmp_notes_dir, make_meeting, fixed_now
+):
+    """_read_note_prompt_data vrátí i topic_terms uložené ve frontmatteru."""
+    store = NoteStore(tmp_notes_dir)
+    m = make_meeting(fixed_now, title="Migrace na PowerShell")
+    m.description = "Nasadíme GitHub a elem6."
+    p = store.create_note(m)
+    names, title, terms = PostProcessor._read_note_prompt_data(p)
+    assert title == "Migrace na PowerShell"
+    assert "PowerShell" in terms
+    assert "GitHub" in terms
+    assert "elem6" in terms
+
+
+def test_topic_terms_from_frontmatter_reach_final_prompt(
+    tmp_notes_dir, make_meeting, fixed_now, cfg
+):
+    """Finální přepis: topic_terms z frontmatteru poznámky se dostanou do
+    initial_prompt (sekce 'Kontext: …'), spolu se jmény a názvem."""
+    store = NoteStore(tmp_notes_dir)
+    m = make_meeting(fixed_now, title="Migrace")
+    m.attendee_names = ["Alice Aldová"]
+    m.description = "Nasadíme PowerShell a elem6."
+    p = store.create_note(m)
+    store.append_segment(p, 0.0, 2.0, "Živý přepis.")
+    w = p[:-3] + ".wav"
+    _write_wav(w)
+
+    prompts: list = []
+
+    def factory(attendees=None):
+        def fake_transcribe(audio, initial_prompt=None):
+            prompts.append(initial_prompt)
+            return [(0.0, 2.0, "Kvalitní finální přepis dost dlouhý.")]
+
+        return fake_transcribe
+
+    events = []
+    pp = PostProcessor(
+        cfg, store, transcribe_factory=factory, on_event=lambda e, d: events.append((e, d))
+    )
+    pp.start()
+    pp.enqueue(p, w)
+    assert _wait_until(
+        lambda: any(e == "PŘEPIS HOTOVO" for e, _ in events)
+    ), "úkol se nedokončil"
+    pp.stop()
+
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    # tematické termíny z popisu jsou v promptu (Kontext)
+    assert "Kontext:" in prompt
+    assert "PowerShell" in prompt
+    assert "elem6" in prompt
+    # jméno i název poznámky tam taky jsou
+    assert "Alice Aldová" in prompt
+    assert "Migrace" in prompt

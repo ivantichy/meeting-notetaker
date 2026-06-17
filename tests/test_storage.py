@@ -116,6 +116,52 @@ class TestCreateNote:
         assert "attendee_names" not in meta  # klíč prostě chybí
         assert meta["title"] == "Stará schůzka"
 
+    def test_topic_terms_written_and_round_trip(
+        self, tmp_notes_dir, make_meeting, fixed_now
+    ):
+        """topic_terms se vytěží z názvu + popisu, zapíšou do frontmatteru a vrátí."""
+        from app.storage import _parse_frontmatter
+
+        store = NoteStore(tmp_notes_dir)
+        m = make_meeting(fixed_now, title="Migrace na PowerShell")
+        m.description = "Nasadíme GitHub a elem6, napojíme MCP server."
+        text = _read(store.create_note(m))
+        assert "topic_terms:" in text
+        meta = _parse_frontmatter(text)
+        # round-trip: termíny z názvu + popisu
+        assert "PowerShell" in meta["topic_terms"]
+        assert "GitHub" in meta["topic_terms"]
+        assert "elem6" in meta["topic_terms"]
+        assert "MCP" in meta["topic_terms"]
+
+    def test_empty_topic_terms_as_yaml_empty_list(
+        self, tmp_notes_dir, make_meeting, fixed_now
+    ):
+        """Bez tematických termínů (běžná česká slova) -> 'topic_terms: []'."""
+        store = NoteStore(tmp_notes_dir)
+        m = make_meeting(fixed_now, title="Týdenní porada")
+        m.description = "Probereme úkoly a termíny."
+        text = _read(store.create_note(m))
+        assert "topic_terms: []" in text
+
+    def test_old_note_without_topic_terms_parses_fine(self, tmp_notes_dir):
+        """Stará poznámka bez klíče topic_terms se naparsuje bez chyby."""
+        from app.storage import _parse_frontmatter
+
+        old = (
+            "---\n"
+            "uid: old-2\n"
+            "title: Stará schůzka\n"
+            "start: 2026-01-01T10:00:00+01:00\n"
+            "platform: meet\n"
+            "attendees: []\n"
+            "status: done\n"
+            "---\n\n# Stará schůzka\n\n## Přepis\n"
+        )
+        meta = _parse_frontmatter(old)
+        assert "topic_terms" not in meta  # klíč prostě chybí
+        assert meta["title"] == "Stará schůzka"
+
     def test_restart_appends_continuation_marker(self, tmp_notes_dir, sample_meeting):
         store = NoteStore(tmp_notes_dir)
         path1 = store.create_note(sample_meeting)

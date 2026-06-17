@@ -85,7 +85,7 @@ def _fm_unquote(value: str) -> str:
 
 #: Klíče frontmatteru, jejichž hodnota je seznam (řádky '- …'). Prázdná hodnota
 #: nebo '[]' u nich znamená prázdný seznam (ne prázdný řetězec).
-_FM_LIST_KEYS = frozenset({"attendees", "attendee_names"})
+_FM_LIST_KEYS = frozenset({"attendees", "attendee_names", "topic_terms"})
 
 
 def _parse_frontmatter(text: str) -> dict:
@@ -198,6 +198,20 @@ class NoteStore:
             lines.extend(f"  - {_fm_quote(n)}" for n in names)
         else:
             lines.append("attendee_names: []")
+        # Tematické termíny vytěžené z názvu + popisu schůzky (additivní klíč).
+        # Počítáme je TADY (při zápisu poznámky), ať je finální přepis dostane
+        # z frontmatteru i bez kalendáře. Lokální, deterministické, bez LLM.
+        # Staré poznámky klíč nemají; parser to snese (vrátí []).
+        from app.glossary import extract_topic_terms
+
+        topic_terms = extract_topic_terms(
+            meeting.title, getattr(meeting, "description", "") or ""
+        )
+        if topic_terms:
+            lines.append("topic_terms:")
+            lines.extend(f"  - {_fm_quote(t)}" for t in topic_terms)
+        else:
+            lines.append("topic_terms: []")
         lines.append(f"join_url: {_fm_quote(meeting.join_url or '')}")
         lines.append("status: recording")
         lines.append("---")

@@ -100,6 +100,37 @@ def test_live_transcribe_uses_multilingual_false_and_prompt_with_attendees(cfg):
     assert captured["vad_parameters"]["max_speech_duration_s"] == 30
 
 
+def test_live_transcribe_includes_topic_terms_in_prompt(cfg):
+    """Živý přepis: tematické termíny předané transcriberu se objeví v
+    initial_prompt jako kontext (sekce 'Kontext: …')."""
+    captured = {}
+
+    class CapturingModel(FakeModel):
+        def transcribe(self, audio, **kw):
+            captured.update(kw)
+            return super().transcribe(audio, **kw)
+
+    tr = Transcriber(
+        cfg,
+        on_segments=lambda segs: None,
+        model_factory=CapturingModel,
+        attendees=["Petr Novák"],
+        title="Migrace",
+        topic_terms=["PowerShell", "elem6"],
+    )
+    tr.start()
+    tr.submit(np.zeros(1600, dtype=np.float32), 0.0)
+    assert _wait_until(lambda: "initial_prompt" in captured)
+    tr.stop()
+
+    prompt = captured["initial_prompt"]
+    assert "Kontext:" in prompt
+    assert "PowerShell" in prompt
+    assert "elem6" in prompt
+    # jméno účastníka je dál na chráněném konci
+    assert "Petr Novák" in prompt
+
+
 def test_stop_drains_remaining_queue(cfg):
     out = []
     # pomalý model, ať se ve frontě stihne nahromadit víc bloků

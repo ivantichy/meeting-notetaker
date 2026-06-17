@@ -36,6 +36,11 @@ class Meeting:
     #: Additivní pole — ``attendees`` (e-maily) zůstává kvůli zpětné kompatibilitě.
     #: Slouží k sestavení initial_prompt slovníku (lepší přepis jmen).
     attendee_names: "list[str]" = field(default_factory=list)
+    #: Vyčištěný popis události z kalendáře (DESCRIPTION) — bez URL, e-mailů,
+    #: telefonů a boilerplate (Teams/Zoom), zkrácený (~800 znaků). Additivní
+    #: pole; chybějící popis -> "". Z něj se lokálně extrahují tematické termíny
+    #: do initial_prompt (kontext konkrétní schůzky, lepší přepis názvů).
+    description: str = ""
 
     @property
     def slug(self) -> str:

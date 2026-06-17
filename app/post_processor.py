@@ -222,12 +222,14 @@ class PostProcessor:
         self._queue.put((note_path, wav_path))
 
     @staticmethod
-    def _read_note_prompt_data(note_path: str) -> "tuple[list[str], str]":
+    def _read_note_prompt_data(note_path: str) -> "tuple[list[str], str, list[str]]":
         """Přečte z frontmatteru DAT TÉTO poznámky podklady pro initial_prompt:
-        jména účastníků a název schůzky. Preferuje zobrazovaná jména
-        (``attendee_names``, CN z kalendáře); když chybí (staré poznámky), padá
-        na ``attendees`` (e-maily). Chyba/chybějící klíč -> prázdné (přepis nesmí
-        spadnout). Vrací ``(jména, název)``.
+        jména účastníků, název schůzky a tematické termíny. Preferuje zobrazovaná
+        jména (``attendee_names``, CN z kalendáře); když chybí (staré poznámky),
+        padá na ``attendees`` (e-maily). ``topic_terms`` jsou auto-extrahované
+        termíny uložené při zápisu poznámky (staré poznámky klíč nemají -> []).
+        Chyba/chybějící klíč -> prázdné (přepis nesmí spadnout). Vrací
+        ``(jména, název, topic_terms)``.
         """
         from app.storage import _parse_frontmatter
 
@@ -235,19 +237,21 @@ class PostProcessor:
             with open(note_path, "r", encoding="utf-8") as f:
                 meta = _parse_frontmatter(f.read())
         except OSError:
-            return [], ""
+            return [], "", []
         names = meta.get("attendee_names")
         if not (isinstance(names, list) and names):
             names = meta.get("attendees")  # fallback: staré poznámky bez CN
         names_list = [str(a) for a in names] if isinstance(names, list) else []
         title = meta.get("title")
         title_str = title if isinstance(title, str) else ""
-        return names_list, title_str
+        terms = meta.get("topic_terms")
+        terms_list = [str(t) for t in terms] if isinstance(terms, list) else []
+        return names_list, title_str, terms_list
 
     @staticmethod
     def _read_attendees(note_path: str) -> "list[str]":
         """Zpětně kompatibilní wrapper: jen jména účastníků pro initial_prompt."""
-        names, _title = PostProcessor._read_note_prompt_data(note_path)
+        names, _title, _terms = PostProcessor._read_note_prompt_data(note_path)
         return names
 
     @staticmethod
@@ -328,10 +332,10 @@ class PostProcessor:
 
         channels, framerate, duration_s = _load_wav_f32(wav_path)
         mono = np.clip(channels.mean(axis=1), -1.0, 1.0).astype(np.float32)
-        # Per-note podklady pro initial_prompt: jména účastníků + název TÉTO
-        # poznámky (ne kešované z první schůzky). Prompt sestavíme níž a předáme
-        # do volání transcribe — model přitom zůstává kešovaný napříč úkoly.
-        names, title = self._read_note_prompt_data(note_path)
+        # Per-note podklady pro initial_prompt: jména účastníků + název +
+        # tematické termíny TÉTO poznámky (ne kešované z první schůzky). Prompt
+        # sestavíme níž a předáme do volání transcribe — model zůstává kešovaný.
+        names, title, topic_terms = self._read_note_prompt_data(note_path)
         if self._transcribe is None:
             # M9: první úkol staví finální model. Když ještě není v models/,
             # spustí ~GB stahování (~2 GB u large-v3-turbo) — ohlásíme to UI
@@ -359,7 +363,7 @@ class PostProcessor:
         # svoje jména, ne ta z první.
         from app.glossary import build_initial_prompt
 
-        prompt = build_initial_prompt(names, title=title)
+        prompt = build_initial_prompt(names, title=title, topic_terms=topic_terms)
         # Per-call prompt předáme transcribe fn. Fake transcribe v testech berou
         # jen audio (1 argument) -> fallback bez promptu (L6, zpětná kompat).
         try:
