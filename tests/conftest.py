@@ -4,6 +4,7 @@ DŮLEŽITÉ: mocky pro 'soundcard' a 'faster_whisper' se instalují do sys.modul
 hned při importu tohoto souboru — dřív, než se importuje cokoliv z app/ —
 takže testy nikdy nenačtou skutečné audio/whisper knihovny (běží i na Linuxu).
 """
+import os
 import sys
 from unittest.mock import MagicMock
 
@@ -16,6 +17,18 @@ import pytest  # noqa: E402
 from dateutil import tz  # noqa: E402
 
 from app.models import Meeting, Platform  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cwd(tmp_path, monkeypatch):
+    """Každý test běží v izolovaném pracovním adresáři.
+
+    Některý produkční kód sahá na relativní soubory v pracovním adresáři appky
+    (např. ``glossary.txt`` vedle ``config.json``). Bez izolace by je testy
+    zakládaly v kořeni repozitáře. Přesměrujeme cwd do ``tmp_path`` — žádný test
+    se na konkrétní cwd nespoléhá (cesty jsou absolutní nebo z ``__file__``).
+    """
+    monkeypatch.chdir(tmp_path)
 
 
 def _ics_dt(dt: datetime) -> str:

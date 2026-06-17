@@ -72,6 +72,49 @@ class TestCreateNote:
         m = make_meeting(fixed_now, attendees=[])
         text = _read(store.create_note(m))
         assert "attendees: []" in text
+        # i prázdná zobrazovaná jména se zapisují jako prázdný YAML seznam
+        assert "attendee_names: []" in text
+
+    def test_attendee_names_written_and_round_trip(
+        self, tmp_notes_dir, make_meeting, fixed_now
+    ):
+        """attendee_names (CN z kalendáře) se zapíšou do frontmatteru a vrátí."""
+        from app.storage import _parse_frontmatter
+
+        store = NoteStore(tmp_notes_dir)
+        m = make_meeting(fixed_now, attendees=["ivan@x.cz", "petr@x.cz"])
+        m.attendee_names = ["Ivan Tichý", "Petr Novák"]
+        text = _read(store.create_note(m))
+        assert "attendee_names:" in text
+        assert "  - Ivan Tichý" in text
+        assert "  - Petr Novák" in text
+        meta = _parse_frontmatter(text)
+        assert meta["attendee_names"] == ["Ivan Tichý", "Petr Novák"]
+        assert meta["attendees"] == ["ivan@x.cz", "petr@x.cz"]
+
+    def test_old_note_without_attendee_names_parses_fine(self, tmp_notes_dir):
+        """Stará poznámka bez klíče attendee_names se naparsuje bez chyby."""
+        from app.storage import _parse_frontmatter
+
+        old = (
+            "---\n"
+            "uid: old-1\n"
+            "title: Stará schůzka\n"
+            "start: 2026-01-01T10:00:00+01:00\n"
+            "platform: meet\n"
+            "attendees:\n"
+            "  - a@x.cz\n"
+            "status: done\n"
+            "---\n\n# Stará schůzka\n\n## Přepis\n"
+        )
+        path = os.path.join(tmp_notes_dir, "old.md")
+        os.makedirs(tmp_notes_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(old)
+        meta = _parse_frontmatter(old)
+        assert meta["attendees"] == ["a@x.cz"]
+        assert "attendee_names" not in meta  # klíč prostě chybí
+        assert meta["title"] == "Stará schůzka"
 
     def test_restart_appends_continuation_marker(self, tmp_notes_dir, sample_meeting):
         store = NoteStore(tmp_notes_dir)

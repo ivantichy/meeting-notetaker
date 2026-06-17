@@ -83,6 +83,11 @@ def _fm_unquote(value: str) -> str:
     return value
 
 
+#: Klíče frontmatteru, jejichž hodnota je seznam (řádky '- …'). Prázdná hodnota
+#: nebo '[]' u nich znamená prázdný seznam (ne prázdný řetězec).
+_FM_LIST_KEYS = frozenset({"attendees", "attendee_names"})
+
+
 def _parse_frontmatter(text: str) -> dict:
     """Naparsuje jednoduchý YAML frontmatter na dict (listy = klíč s '- ' řádky)."""
     meta: dict = {}
@@ -102,10 +107,10 @@ def _parse_frontmatter(text: str) -> dict:
             key = key.strip()
             value = value.strip()
             if value == "" or value == "[]":
-                meta[key] = [] if key == "attendees" else value
-                current_list_key = key if value == "" else None
-                if value == "" and key == "attendees":
-                    meta[key] = []
+                is_list_key = key in _FM_LIST_KEYS
+                meta[key] = [] if is_list_key else value
+                # Po prázdné hodnotě listového klíče čteme následující '- ' řádky.
+                current_list_key = key if (value == "" and is_list_key) else None
             else:
                 meta[key] = _fm_unquote(value)
                 current_list_key = None
@@ -185,6 +190,14 @@ class NoteStore:
             lines.extend(f"  - {_fm_quote(a)}" for a in meeting.attendees)
         else:
             lines.append("attendees: []")
+        # Zobrazovaná jména (CN z kalendáře) — additivní klíč pro initial_prompt
+        # slovník. Staré poznámky ho nemají; parser to snese (vrátí []).
+        names = getattr(meeting, "attendee_names", None) or []
+        if names:
+            lines.append("attendee_names:")
+            lines.extend(f"  - {_fm_quote(n)}" for n in names)
+        else:
+            lines.append("attendee_names: []")
         lines.append(f"join_url: {_fm_quote(meeting.join_url or '')}")
         lines.append("status: recording")
         lines.append("---")

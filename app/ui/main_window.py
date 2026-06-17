@@ -171,10 +171,13 @@ class MainWindow(QMainWindow):
         show_action.triggered.connect(self._restore_window)
         settings_action = QAction("Nastavení…", self)
         settings_action.triggered.connect(self._open_settings)
+        glossary_action = QAction("Otevřít glosář…", self)
+        glossary_action.triggered.connect(self._open_glossary)
         quit_action = QAction("Ukončit", self)
         quit_action.triggered.connect(self._quit)
         tray_menu.addAction(show_action)
         tray_menu.addAction(settings_action)
+        tray_menu.addAction(glossary_action)
         tray_menu.addSeparator()
         tray_menu.addAction(quit_action)
         self._tray.setContextMenu(tray_menu)
@@ -570,6 +573,25 @@ class MainWindow(QMainWindow):
             return
         # CalendarService čte cfg.ics_url přímo, takže stačí obnovit kalendář.
         self.refresh_calendar()
+
+    def _open_glossary(self) -> None:
+        """Otevře editovatelný slovník ``glossary.txt`` ve výchozím editoru.
+        Když soubor ještě neexistuje, nejdřív ho vytvoří (předvyplněný
+        vestavěnými termíny), ať má uživatel co editovat."""
+        import os as _os
+
+        from app.glossary import ensure_glossary_file
+
+        try:
+            path = ensure_glossary_file()
+            _os.startfile(_os.path.abspath(path))  # noqa: S606 - otevře v editoru
+        except Exception:  # noqa: BLE001
+            log.exception("Otevření glosáře selhalo")
+            QMessageBox.warning(
+                self,
+                "Glosář",
+                "Soubor glossary.txt se nepodařilo otevřít.",
+            )
 
     # ------------------------------------------------------------------ tray
 

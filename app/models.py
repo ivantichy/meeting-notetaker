@@ -32,6 +32,10 @@ class Meeting:
     platform: Platform
     join_url: "str | None" = None
     attendees: "list[str]" = field(default_factory=list)
+    #: Zobrazovaná jména účastníků (CN z kalendáře), když jsou k dispozici.
+    #: Additivní pole — ``attendees`` (e-maily) zůstává kvůli zpětné kompatibilitě.
+    #: Slouží k sestavení initial_prompt slovníku (lepší přepis jmen).
+    attendee_names: "list[str]" = field(default_factory=list)
 
     @property
     def slug(self) -> str:

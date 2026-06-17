@@ -114,8 +114,11 @@ def _attribute_speakers(channels, framerate: int, segments: "list") -> "list":
 def _build_default_transcribe(cfg, attendees=None):
     """Vytvoří přepisovací funkci nad faster-whisper modelem cfg.post_model.
 
-    ``attendees`` (jména z frontmatteru poznámky) se doplní do initial_prompt
-    slovníku, ať model trefí jména účastníků (kvalita přepisu).
+    Model se postaví JEDNOU a drží se (je velký). ``initial_prompt`` (slovník
+    jmen/termínů) se NEpečetí do modelu — předává se PER VOLÁNÍ, takže každá
+    poznámka dostane prompt ze SVÝCH dat (jména + název), ne z první zpracované
+    schůzky. ``attendees`` je jen fallback prompt, když volající žádný nepředá
+    (a kvůli zpětné kompatibilitě se starým podpisem).
     """
     from faster_whisper import WhisperModel  # líný import — na Linuxu/testech mock
 
@@ -129,13 +132,15 @@ def _build_default_transcribe(cfg, attendees=None):
         cpu_threads=max(2, (os.cpu_count() or 8) // 2),
         num_workers=1,
     )
-    prompt = build_initial_prompt(attendees)
+    fallback_prompt = build_initial_prompt(attendees)
 
-    def _transcribe(audio):
+    def _transcribe(audio, initial_prompt=None):
         # Jazyk detekujeme JEDNOU (multilingual=False): konkrétní kód z configu
         # předáme natvrdo, "auto"/"" -> language=None (faster-whisper detekuje
         # z ~prvních 30 s a dál ho nepřepíná po segmentech).
         lang = cfg.language if cfg.language not in ("", "auto") else None
+        # Per-note prompt (z volání) má přednost; jinak fallback z buildu.
+        prompt = initial_prompt if initial_prompt is not None else fallback_prompt
         segments, _info = model.transcribe(
             audio,
             language=lang,
@@ -217,9 +222,12 @@ class PostProcessor:
         self._queue.put((note_path, wav_path))
 
     @staticmethod
-    def _read_attendees(note_path: str) -> "list[str]":
-        """Přečte ``attendees`` z YAML frontmatteru poznámky (pro initial_prompt
-        slovník). Chyba/chybějící klíč -> prázdný seznam (přepis nesmí spadnout).
+    def _read_note_prompt_data(note_path: str) -> "tuple[list[str], str]":
+        """Přečte z frontmatteru DAT TÉTO poznámky podklady pro initial_prompt:
+        jména účastníků a název schůzky. Preferuje zobrazovaná jména
+        (``attendee_names``, CN z kalendáře); když chybí (staré poznámky), padá
+        na ``attendees`` (e-maily). Chyba/chybějící klíč -> prázdné (přepis nesmí
+        spadnout). Vrací ``(jména, název)``.
         """
         from app.storage import _parse_frontmatter
 
@@ -227,9 +235,20 @@ class PostProcessor:
             with open(note_path, "r", encoding="utf-8") as f:
                 meta = _parse_frontmatter(f.read())
         except OSError:
-            return []
-        att = meta.get("attendees")
-        return [str(a) for a in att] if isinstance(att, list) else []
+            return [], ""
+        names = meta.get("attendee_names")
+        if not (isinstance(names, list) and names):
+            names = meta.get("attendees")  # fallback: staré poznámky bez CN
+        names_list = [str(a) for a in names] if isinstance(names, list) else []
+        title = meta.get("title")
+        title_str = title if isinstance(title, str) else ""
+        return names_list, title_str
+
+    @staticmethod
+    def _read_attendees(note_path: str) -> "list[str]":
+        """Zpětně kompatibilní wrapper: jen jména účastníků pro initial_prompt."""
+        names, _title = PostProcessor._read_note_prompt_data(note_path)
+        return names
 
     @staticmethod
     def _discard_wav(wav_path: str) -> None:
@@ -309,7 +328,10 @@ class PostProcessor:
 
         channels, framerate, duration_s = _load_wav_f32(wav_path)
         mono = np.clip(channels.mean(axis=1), -1.0, 1.0).astype(np.float32)
-        attendees = self._read_attendees(note_path)
+        # Per-note podklady pro initial_prompt: jména účastníků + název TÉTO
+        # poznámky (ne kešované z první schůzky). Prompt sestavíme níž a předáme
+        # do volání transcribe — model přitom zůstává kešovaný napříč úkoly.
+        names, title = self._read_note_prompt_data(note_path)
         if self._transcribe is None:
             # M9: první úkol staví finální model. Když ještě není v models/,
             # spustí ~GB stahování (~2 GB u large-v3-turbo) — ohlásíme to UI
@@ -322,15 +344,28 @@ class PostProcessor:
             else:
                 self.model_status = "downloading"
             try:
-                # Účastníky (z frontmatteru) předáme do initial_prompt slovníku.
-                # Fake factories v testech berou 0 argumentů -> fallback (L6).
+                # Model se staví JEDNOU a drží se; initial_prompt už do něj
+                # NEpečetíme (počítá se per-note níž). Předáme jména této první
+                # poznámky jen jako fallback (a kvůli starému podpisu). Fake
+                # factories v testech berou 0 argumentů -> fallback (L6).
                 try:
-                    self._transcribe = self._transcribe_factory(attendees=attendees)
+                    self._transcribe = self._transcribe_factory(attendees=names)
                 except TypeError:
                     self._transcribe = self._transcribe_factory()
             finally:
                 self.model_status = "ready"
-        segments = self._transcribe(mono)
+        # Per-note prompt z DAT TÉTO poznámky (jména + název + čerstvý slovník).
+        # Tím je prompt odpojený od kešovaného modelu — druhá schůzka dostane
+        # svoje jména, ne ta z první.
+        from app.glossary import build_initial_prompt
+
+        prompt = build_initial_prompt(names, title=title)
+        # Per-call prompt předáme transcribe fn. Fake transcribe v testech berou
+        # jen audio (1 argument) -> fallback bez promptu (L6, zpětná kompat).
+        try:
+            segments = self._transcribe(mono, initial_prompt=prompt)
+        except TypeError:
+            segments = self._transcribe(mono)
         labeled = _attribute_speakers(channels, framerate, segments)
         # Slij roztříštěné segmenty téhož mluvčího a zahoď doslovné duplicity
         # (Whisper u váhavé řeči sype 1-3 slova na řádek a občas řádek zopakuje).

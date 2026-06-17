@@ -106,6 +106,7 @@ class Transcriber:
         on_error: "Callable[[str], None] | None" = None,
         model_factory: "Callable[[], object] | None" = None,
         attendees: "list[str] | None" = None,
+        title: "str | None" = None,
     ):
         self._cfg = cfg
         self._on_segments = on_segments
@@ -113,6 +114,8 @@ class Transcriber:
         #: slovníku, ať Whisper trefí jejich jména (kvalita přepisu). Prázdné
         #: u ručního záznamu nebo když je Recorder nepředá.
         self._attendees = list(attendees or [])
+        #: Název schůzky — jde do initial_prompt jako kontext tématu (volitelně).
+        self._title = (title or "").strip()
         #: Voláno (z vlákna start()) při neúspěšném načtení modelu — UI to má
         #: tvrdě ohlásit místo nekonečného opakování po blocích (H1).
         self._on_error = on_error or (lambda msg: None)
@@ -268,7 +271,7 @@ class Transcriber:
             vad_parameters=dict(min_speech_duration_ms=250, max_speech_duration_s=30),
             beam_size=1,
             condition_on_previous_text=False,
-            initial_prompt=build_initial_prompt(self._attendees),
+            initial_prompt=build_initial_prompt(self._attendees, title=self._title),
         )
         out: list[tuple[float, float, str]] = []
         for seg in segments:

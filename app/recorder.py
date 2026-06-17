@@ -30,10 +30,10 @@ def _default_capture_factory(cfg, on_chunk):
     return AudioCapture(cfg, on_chunk)
 
 
-def _default_transcriber_factory(cfg, on_segments, attendees=None):
+def _default_transcriber_factory(cfg, on_segments, attendees=None, title=None):
     from app.transcriber import Transcriber
 
-    return Transcriber(cfg, on_segments, attendees=attendees)
+    return Transcriber(cfg, on_segments, attendees=attendees, title=title)
 
 
 class Recorder:
@@ -109,12 +109,19 @@ class Recorder:
                 )
 
             path = self._store.create_note(meeting)
-            # Účastníky meetingu předáme transcriberu pro initial_prompt slovník
-            # (lepší přepis jmen). Fake factories v testech berou jen 2 argumenty
-            # — pak attendees vynecháme (zpětná kompatibilita).
+            # Účastníky + název meetingu předáme transcriberu pro initial_prompt
+            # slovník (lepší přepis jmen). Preferujeme zobrazovaná jména (CN z
+            # kalendáře); když chybí, padáme na e-maily. Fake factories v testech
+            # berou jen 2 argumenty — pak je vynecháme (zpětná kompatibilita).
+            prompt_names = (
+                getattr(meeting, "attendee_names", None) or meeting.attendees
+            )
             try:
                 transcriber = self._transcriber_factory(
-                    self._cfg, self._handle_segments, attendees=meeting.attendees
+                    self._cfg,
+                    self._handle_segments,
+                    attendees=prompt_names,
+                    title=meeting.title,
                 )
             except TypeError:
                 transcriber = self._transcriber_factory(self._cfg, self._handle_segments)

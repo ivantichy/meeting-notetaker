@@ -325,7 +325,7 @@ def test_default_transcribe_passes_multilingual_false_and_prompt():
     # atribut WhisperModel, ať vrátí náš fake model.
     with mock.patch.object(faster_whisper, "WhisperModel", return_value=fake_model):
         transcribe = pp._build_default_transcribe(cfg, attendees=["Petr"])
-    transcribe(object())
+    transcribe(object())  # bez per-call promptu -> fallback z buildu
 
     _, kwargs = fake_model.transcribe.call_args
     assert kwargs["multilingual"] is False
@@ -334,3 +334,113 @@ def test_default_transcribe_passes_multilingual_false_and_prompt():
     assert "Petr" in kwargs["initial_prompt"]
     assert kwargs["vad_parameters"]["min_speech_duration_ms"] == 250
     assert kwargs["vad_parameters"]["max_speech_duration_s"] == 30
+
+
+def test_default_transcribe_per_call_prompt_overrides_fallback():
+    """initial_prompt předaný do volání má přednost před promptem z buildu —
+    tím je prompt odpojený od (kešovaného) modelu."""
+    from unittest.mock import MagicMock
+
+    import faster_whisper
+
+    import app.post_processor as pp
+
+    fake_model = MagicMock()
+    fake_model.transcribe.return_value = ([], object())
+    cfg = AppConfig(post_model="large-v3-turbo", language="cs")
+
+    with mock.patch.object(faster_whisper, "WhisperModel", return_value=fake_model):
+        transcribe = pp._build_default_transcribe(cfg, attendees=["Petr"])
+    # stejná (kešovaná) transcribe fn, ale jiný per-call prompt
+    transcribe(object(), initial_prompt="PROMPT PRO TUTO POZNAMKU")
+
+    _, kwargs = fake_model.transcribe.call_args
+    assert kwargs["initial_prompt"] == "PROMPT PRO TUTO POZNAMKU"
+
+
+def test_per_note_prompt_reflects_each_notes_names_not_cached_first(
+    tmp_notes_dir, make_meeting, fixed_now, cfg
+):
+    """KLÍČOVÉ: prompt se počítá per-note z DAT TÉ poznámky, ne z první
+    zpracované schůzky. Dvě poznámky s různými účastníky -> různé prompty,
+    přestože model (transcribe fn) je kešovaný napříč úkoly."""
+    store = NoteStore(tmp_notes_dir)
+
+    # Dvě schůzky s různými jmény (CN -> attendee_names ve frontmatteru).
+    m1 = make_meeting(fixed_now, title="Schůzka A")
+    m1.attendee_names = ["Alice Aldová"]
+    p1 = store.create_note(m1)
+    store.append_segment(p1, 0.0, 2.0, "Živý přepis A.")
+    w1 = p1[:-3] + ".wav"
+    _write_wav(w1)
+
+    m2 = make_meeting(
+        fixed_now + timedelta(hours=2), title="Schůzka B"
+    )
+    m2.attendee_names = ["Bob Bartoš"]
+    p2 = store.create_note(m2)
+    store.append_segment(p2, 0.0, 2.0, "Živý přepis B.")
+    w2 = p2[:-3] + ".wav"
+    _write_wav(w2)
+
+    prompts: list = []
+
+    def factory(attendees=None):
+        # JEDEN "model" (kešovaná transcribe fn) napříč úkoly. Zachytí per-call
+        # prompt a vrátí dostatečně dlouhý finální přepis (projde M5 guardem).
+        def fake_transcribe(audio, initial_prompt=None):
+            prompts.append(initial_prompt)
+            return [(0.0, 2.0, "Kvalitní finální přepis dost dlouhý.")]
+
+        return fake_transcribe
+
+    events = []
+    pp = PostProcessor(
+        cfg,
+        store,
+        transcribe_factory=factory,
+        on_event=lambda e, d: events.append((e, d)),
+    )
+    pp.start()
+    pp.enqueue(p1, w1)
+    pp.enqueue(p2, w2)
+    assert _wait_until(
+        lambda: sum(1 for e, _ in events if e == "PŘEPIS HOTOVO") >= 2
+    ), "oba úkoly se nedokončily"
+    pp.stop()
+
+    assert len(prompts) == 2
+    prompt_a, prompt_b = prompts[0], prompts[1]
+    # každý prompt obsahuje jména SVÉ poznámky a název SVÉ poznámky
+    assert "Alice Aldová" in prompt_a and "Schůzka A" in prompt_a
+    assert "Bob Bartoš" in prompt_b and "Schůzka B" in prompt_b
+    # a NEobsahuje jméno té druhé schůzky (nezůstal zapečený prompt první)
+    assert "Bob Bartoš" not in prompt_a
+    assert "Alice Aldová" not in prompt_b
+    # slovník je v obou
+    assert "Claude" in prompt_a and "Claude" in prompt_b
+
+
+def test_read_note_prompt_data_prefers_names_falls_back_to_emails(
+    tmp_notes_dir, make_meeting, fixed_now
+):
+    """_read_note_prompt_data bere attendee_names; když chybí, padá na e-maily."""
+    store = NoteStore(tmp_notes_dir)
+
+    # poznámka s CN jmény
+    m1 = make_meeting(fixed_now, title="S CN", attendees=["x@a.cz"])
+    m1.attendee_names = ["Jana Nováková"]
+    p1 = store.create_note(m1)
+    names1, title1 = PostProcessor._read_note_prompt_data(p1)
+    assert names1 == ["Jana Nováková"]
+    assert title1 == "S CN"
+
+    # stará poznámka bez attendee_names -> fallback na e-maily
+    m2 = make_meeting(
+        fixed_now + timedelta(hours=1), title="Bez CN", attendees=["karel@a.cz"]
+    )
+    # nesimulujeme attendee_names (zůstane prázdné [])
+    p2 = store.create_note(m2)
+    names2, title2 = PostProcessor._read_note_prompt_data(p2)
+    assert names2 == ["karel@a.cz"]
+    assert title2 == "Bez CN"

@@ -99,19 +99,49 @@ def _detect_platform(event) -> "tuple[Platform, str | None]":
 
 
 def _attendees(event) -> "list[str]":
+    """Seznam e-mailů účastníků (bez ``mailto:``). Zachováno kvůli zpětné
+    kompatibilitě (frontmatter klíč ``attendees``)."""
+    emails, _names = _attendees_and_names(event)
+    return emails
+
+
+def _attendee_names(event) -> "list[str]":
+    """Zobrazovaná jména účastníků (``CN`` z kalendáře); když CN chybí, padá na
+    lokální část e-mailu (před ``@``). Slouží k initial_prompt slovníku."""
+    _emails, names = _attendees_and_names(event)
+    return names
+
+
+def _attendees_and_names(event) -> "tuple[list[str], list[str]]":
+    """Naparsuje ATTENDEE na (e-maily, zobrazovaná jména).
+
+    U každého účastníka vezme ``CN`` parametr (zobrazované jméno) když existuje,
+    jinak lokální část e-mailu. E-mail (bez ``mailto:``) jde do prvního seznamu,
+    jméno do druhého. Prázdné položky zahodí.
+    """
     value = event.get("ATTENDEE")
     if value is None:
-        return []
+        return [], []
     if not isinstance(value, list):
         value = [value]
-    out = []
+    emails: "list[str]" = []
+    names: "list[str]" = []
     for a in value:
-        s = str(a)
-        if s.lower().startswith("mailto:"):
-            s = s[len("mailto:"):]
-        if s:
-            out.append(s)
-    return out
+        email = str(a)
+        if email.lower().startswith("mailto:"):
+            email = email[len("mailto:"):]
+        email = email.strip()
+        # CN (zobrazované jméno) je parametr vlastnosti ATTENDEE.
+        cn = ""
+        params = getattr(a, "params", None)
+        if params is not None:
+            cn = str(params.get("CN", "") or "").strip()
+        if email:
+            emails.append(email)
+        name = cn or (email.split("@", 1)[0].strip() if email else "")
+        if name:
+            names.append(name)
+    return emails, names
 
 
 def parse_meetings(ics_text: str, window_days: int = 7) -> "list[Meeting]":
@@ -154,6 +184,7 @@ def parse_meetings(ics_text: str, window_days: int = 7) -> "list[Meeting]":
             platform, join_url = _detect_platform(event)
             ics_uid = str(event.get("UID", ""))
             title = str(event.get("SUMMARY", "")) or "Bez názvu"
+            emails, names = _attendees_and_names(event)
 
             meetings.append(
                 Meeting(
@@ -163,7 +194,8 @@ def parse_meetings(ics_text: str, window_days: int = 7) -> "list[Meeting]":
                     end=end,
                     platform=platform,
                     join_url=join_url,
-                    attendees=_attendees(event),
+                    attendees=emails,
+                    attendee_names=names,
                 )
             )
         except Exception:  # noqa: BLE001 - přeskočit vadnou událost, ostatní zpracovat

@@ -42,6 +42,48 @@ class TestSingleMeetEvent:
         assert "ivan@example.com" in m.attendees
         assert "petr@example.com" in m.attendees
 
+    def test_attendee_names_parsed_from_cn(self, ics_single_meet):
+        """CN (zobrazované jméno) z ATTENDEE se naparsuje do attendee_names."""
+        (m,) = parse_meetings(ics_single_meet)
+        assert m.attendee_names == ["Ivan", "Petr"]
+        # e-maily zůstávají v attendees (zpětná kompatibilita)
+        assert m.attendees == ["ivan@example.com", "petr@example.com"]
+
+
+class TestAttendeeNamesFallback:
+    """CN -> attendee_names; chybějící CN -> lokální část e-mailu."""
+
+    def _event(self, now) -> str:
+        from datetime import timezone
+
+        def _z(dt):
+            return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+        start = now + timedelta(hours=1)
+        return "\n".join(
+            [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                "PRODID:-//test//x//CS",
+                "BEGIN:VEVENT",
+                "UID:names-1@example.com",
+                f"DTSTART:{_z(start)}",
+                f"DTEND:{_z(start + timedelta(hours=1))}",
+                "SUMMARY:Schůzka se jmény",
+                "DESCRIPTION:https://meet.google.com/aaa-bbbb-ccc",
+                "ATTENDEE;CN=Jana Nováková:mailto:jana@example.com",
+                "ATTENDEE:mailto:karel@example.com",  # bez CN -> lokální část
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ]
+        )
+
+    def test_cn_used_and_email_local_part_fallback(self, now_local):
+        (m,) = parse_meetings(self._event(now_local))
+        # první má CN, druhý padá na lokální část e-mailu
+        assert m.attendee_names == ["Jana Nováková", "karel"]
+        assert m.attendees == ["jana@example.com", "karel@example.com"]
+
 
 class TestRecurringTeamsEvent:
     def test_expands_single_occurrence_in_default_window(self, ics_weekly_teams):
