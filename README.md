@@ -98,7 +98,7 @@ The project ships with a unit-test suite that runs without any audio or Whisper 
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-There are currently **87 tests** covering calendar parsing, the scheduler, note storage, the recorder state machine, call detection, and post-processing. `ARCHITECTURE.md` describes the module layout, contracts, and threading model.
+There are currently **200+ tests** covering calendar parsing, the scheduler, note storage, the recorder state machine, call detection, post-processing, the glossary, and the MCP server. `ARCHITECTURE.md` describes the module layout, contracts, and threading model.
 
 ## MCP server (transcripts as tools)
 
@@ -161,7 +161,13 @@ Installed build:
 }
 ```
 
-(If your client does not expand environment variables in paths, write the resolved absolute path to `meeting-notetaker-mcp.exe`.) After registering, restart the client; the four tools above appear under the **meeting-notetaker** server.
+(If your client does not expand environment variables in paths, write the resolved absolute path to `meeting-notetaker-mcp.exe`.) After registering, restart the client; the seven tools above appear under the **meeting-notetaker** server.
+
+## Companion Claude skill
+
+A thin Claude skill ships with this repo at [`skill/meeting-notetaker/SKILL.md`](skill/meeting-notetaker/SKILL.md). It sits on top of the MCP server: it routes meeting/transcript questions to the MCP tools and carries the domain knowledge a tool description can't — when to prefer these transcripts over Granola's (Granola does not handle Czech well), the live-vs-final quality distinction, the privacy reminder, how to operate/debug the app, and an offline fallback for locating the notes when the MCP is not connected.
+
+It is source you install, not something the app activates: add it to your Claude client (e.g. **Settings → Capabilities**, or your own skill-deployment workflow).
 
 ## License
 
