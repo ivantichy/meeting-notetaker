@@ -346,8 +346,9 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
 - Audio device missing or lost mid-call -> capture raises a device error that stops the
   recording and shows a rate-limited message.
 - Whisper model download (first run, ~2 GB from Hugging Face) -> happens lazily on first
-  use; there is no progress indicator yet (planned). The live queue is bounded (drops the
-  oldest chunk under back-pressure) and a model-load failure is reported, not swallowed.
+  use; the status bar shows a "Stahuji model…" indicator while it downloads. The live
+  queue is bounded (drops the oldest chunk under back-pressure) and a model-load failure
+  is reported, not swallowed.
 - App restart mid-meeting -> the scheduler sees the in-progress meeting -> start() ->
   NoteStore appends a continuation marker. Unfinished re-transcriptions are picked up
   by the post-processor's orphan scan on the next start.
@@ -368,7 +369,7 @@ requests  icalendar  recurring-ical-events  python-dateutil  tzdata
 `conftest.py` injects `sys.modules['soundcard'] = MagicMock()` (and the same for
 `faster_whisper`) before the app is imported, and provides fixtures: sample ICS text
 (single + recurring + Meet + Teams + an all-day event to ignore), a temp notes dir,
-and a freeze-time helper. The suite has 206 tests:
+and a freeze-time helper. The suite has 240+ tests, including:
 
 - `test_calendar`: parse single/recurring events, platform & URL detection, window
   filtering, sort order, time zones.
@@ -401,5 +402,10 @@ Run them with:
 
 ## Integration with Claude
 
-Notes land in `notes/*.md` inside the mounted folder, so Claude can read them
-directly — no MCP is needed (one could be added later).
+Notes land in `notes/*.md` next to the app. Claude can read them directly, but the
+primary integration is the bundled **MCP server** (`app/mcp_server.py`, shipped as
+`meeting-notetaker-mcp.exe` by the installer): it exposes the transcripts as read-only
+tools (list / search / get / today) plus glossary read/edit, and locates the notes via
+`%LOCALAPPDATA%\MeetingNotetaker\app-info.json`. A thin companion skill
+(`skill/meeting-notetaker/SKILL.md`) routes meeting questions to those tools and carries
+the domain rules (Granola arbitration, live-vs-final quality, privacy, offline fallback).

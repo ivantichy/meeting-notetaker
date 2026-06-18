@@ -98,7 +98,7 @@ The project ships with a unit-test suite that runs without any audio or Whisper 
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-There are currently **200+ tests** covering calendar parsing, the scheduler, note storage, the recorder state machine, call detection, post-processing, the glossary, and the MCP server. `ARCHITECTURE.md` describes the module layout, contracts, and threading model.
+There are currently **240+ tests** covering calendar parsing, the scheduler, note storage, the recorder state machine, call detection, post-processing, the glossary, and the MCP server. `ARCHITECTURE.md` describes the module layout, contracts, and threading model.
 
 ## MCP server (transcripts as tools)
 
