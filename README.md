@@ -148,20 +148,22 @@ Dev checkout (replace `<repo>` with the absolute path to this project):
 }
 ```
 
-Installed build:
+Installed build — **use the resolved absolute path** (replace `<you>` with your Windows username):
 
 ```json
 {
   "mcpServers": {
     "meeting-notetaker": {
-      "command": "%LOCALAPPDATA%\\Programs\\MeetingNotetaker\\meeting-notetaker-mcp.exe",
+      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\MeetingNotetaker\\meeting-notetaker-mcp.exe",
       "args": []
     }
   }
 }
 ```
 
-(If your client does not expand environment variables in paths, write the resolved absolute path to `meeting-notetaker-mcp.exe`.) After registering, restart the client; the seven tools above appear under the **meeting-notetaker** server.
+> **Important — do not use `%LOCALAPPDATA%` (or any other environment variable) in `command`.** Claude Desktop, and most MCP clients, spawn `command` directly **without expanding environment variables**. A path like `%LOCALAPPDATA%\Programs\MeetingNotetaker\meeting-notetaker-mcp.exe` is passed through literally, so the client tries to launch a file that does not exist and fails with `spawn ... ENOENT` ("the system cannot find the path specified"). Always write the fully resolved absolute path. The installer puts the executable under `%LOCALAPPDATA%\Programs\MeetingNotetaker\` — for the default per-user install that resolves to `C:\Users\<you>\AppData\Local\Programs\MeetingNotetaker\meeting-notetaker-mcp.exe`. (To find your value, run `echo %LOCALAPPDATA%` in `cmd`.)
+
+After registering, restart the client; the seven tools above appear under the **meeting-notetaker** server.
 
 ## Companion Claude skill
 
