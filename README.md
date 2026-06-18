@@ -37,7 +37,7 @@ A local, bot-free meeting recorder and notetaker for Windows — records your ca
 
 To get names and jargon right, the transcriber is given a short list of words as context. It comes from three sources:
 
-- **Your glossary.** An editable `glossary.txt` lives next to `config.json`. It is created automatically the first time it is needed and **starts empty** (just a comment header) — add one term per line (tool, product and brand names, jargon, words that get garbled); blank lines and lines starting with `#` are ignored. Edit it at any time while the app is running via the tray item **Otevřít glosář…** ("Open glossary"); changes apply to the next transcription, with no rebuild.
+- **Your glossary.** An editable `glossary.txt` lives next to `config.json`. It is created automatically the first time it is needed and **starts empty** (just a comment header) — add one term per line (tool, product and brand names, jargon, words that get garbled); blank lines and lines starting with `#` are ignored. Edit it at any time while the app is running via the tray item **Otevřít glosář…** ("Open glossary"); changes apply to the next transcription, with no rebuild. **Keep it small and focused** — the words feed Whisper's prompt, which is capped at ~224 tokens, so a long list gets truncated and can crowd out the per-meeting participant names; add only terms that are actually mis-transcribed (a few dozen at most, not hundreds).
 - **Participant names.** The names of the people on the call are pulled automatically from the calendar invite, so the transcript spells them correctly.
 - **Per-meeting topic terms.** A few likely terms (product names, acronyms, codes) are also extracted automatically from the calendar event's description for that specific meeting.
 

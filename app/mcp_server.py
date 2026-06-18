@@ -379,6 +379,8 @@ def get_glossary_tool() -> str:
     biases the Meeting Notetaker's Czech transcription so those words aren't
     mis-transcribed (e.g. ``elem6``, ``Claude``, ``Kubernetes``). It is the only
     editable surface of this server — transcripts themselves are read-only.
+    Keep it small — it feeds a ~224-token Whisper prompt, so a bloated list gets
+    truncated and can crowd out the per-meeting attendee names.
     Returns a JSON object ``{"glossary": [...]}`` with the terms in file order.
     Use ``add_glossary_terms`` / ``remove_glossary_terms`` to change it.
     """
@@ -396,8 +398,11 @@ def add_glossary_terms_tool(terms: "list[str]") -> str:
     skipped; the glossary file's comments and ordering are preserved. The change
     applies to the NEXT transcription (no restart needed). This glossary is the
     only thing this server can edit — meeting transcripts/notes stay read-only.
-    Returns JSON ``{"added": [...], "glossary": [...]}`` (the terms newly added
-    and the resulting full glossary).
+    Keep the glossary small and high-value — it feeds a ~224-token Whisper
+    prompt, so a bloated list gets truncated and can crowd out the per-meeting
+    attendee names; add only terms that are actually mis-transcribed, not bulk
+    vocabulary. Returns JSON ``{"added": [...], "glossary": [...]}`` (the terms
+    newly added and the resulting full glossary).
 
     Args:
         terms: Words/phrases to add (e.g. ["elem6", "Kubernetes"]).

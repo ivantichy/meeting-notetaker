@@ -23,7 +23,11 @@ když je MCP dostupné:
 - `get_today` — dnešní meetingy/přepisy („shrň mi dnešní call").
 - Slovník (editovatelný): `get_glossary` (vypiš termíny), `add_glossary_terms`
   (přidej jména/názvy firem/produktů, ať je Whisper přepisuje správně),
-  `remove_glossary_terms` (odeber).
+  `remove_glossary_terms` (odeber). Glosář drž **malý a cílený** — jde do
+  Whisperova `initial_prompt` s ~224 token stropem, takže nafouklý seznam se
+  ořeže a může vytlačit jména účastníků daného meetingu; přidávej jen termíny,
+  které se reálně komolí (jména, názvy firem/produktů, žargon), ne běžnou
+  slovní zásobu — řádově desítky položek, ne stovky.
 
 Přepisy a metadata jsou pro tyhle nástroje **read-only**; měnit jde jen slovník.
 
