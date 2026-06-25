@@ -118,6 +118,14 @@ def main() -> int:
             log.info("Zařazeno %d nedopřepsaných WAV z minula.", orphans)
     recorder.on_finished.append(post_processor.enqueue)
 
+    # W1: hned po startu na pozadí předstáhni modely (živý i finální), ať čerstvá
+    # instalace s prázdnou cache models/ nezabije první hovor stahováním přesně v
+    # okamžiku, kdy má začít nahrávání. Neblokuje UI a selhání je nezávazné
+    # (nahrávání má svůj dosavadní lazy fallback).
+    from app.model_warmup import start_model_warmup
+
+    start_model_warmup(cfg)
+
     window = MainWindow(cfg, calendar_service, recorder, post_processor=post_processor)
     # Start na pozadí: aplikace žije v oznamovací oblasti (tray). Okno otevře
     # uživatel dvojklikem na ikonu nebo přes „Zobrazit" v jejím menu.

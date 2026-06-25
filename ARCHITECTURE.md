@@ -335,6 +335,9 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
   in roughly 5–15 s with the `small` int8 model on this CPU, so it keeps up live and
   the queue drains on stop.
 - Post-processor: 1 daemon thread that re-transcribes finished recordings.
+- Model warm-up: 1 short-lived daemon thread started at app launch that pre-downloads the
+  live and post models if missing (`model_warmup.py`), then exits. Defensive: any error is
+  logged and never blocks startup or recording.
 - Calendar refresh: a QThread worker.
 - Note appends happen on the transcriber thread — NoteStore uses a simple
   `open(..., 'a')` per call (atomic enough; single writer).
@@ -345,10 +348,14 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
   (the secret calendar URL is never written to the log or the UI).
 - Audio device missing or lost mid-call -> capture raises a device error that stops the
   recording and shows a rate-limited message.
-- Whisper model download (first run, ~2 GB from Hugging Face) -> happens lazily on first
-  use; the status bar shows a "Stahuji model…" indicator while it downloads. The live
-  queue is bounded (drops the oldest chunk under back-pressure) and a model-load failure
-  is reported, not swallowed.
+- Whisper model download (first run, ~2 GB from Hugging Face) -> the live and post models
+  are pre-fetched in the background at startup (`model_warmup.py`, a daemon thread), so a
+  fresh install does not start a multi-hundred-MB download at the exact moment the first
+  call begins recording (which would otherwise make CTranslate2 fail to open the
+  still-incomplete `model.bin`). If a model is still missing when needed it is fetched
+  lazily on first use as before, and the status bar shows a "Stahuji model…" indicator
+  while a download is in progress. The live queue is bounded (drops the oldest chunk under
+  back-pressure) and a model-load failure is reported, not swallowed.
 - App restart mid-meeting -> the scheduler sees the in-progress meeting -> start() ->
   NoteStore appends a continuation marker. Unfinished re-transcriptions are picked up
   by the post-processor's orphan scan on the next start.
@@ -369,7 +376,7 @@ requests  icalendar  recurring-ical-events  python-dateutil  tzdata
 `conftest.py` injects `sys.modules['soundcard'] = MagicMock()` (and the same for
 `faster_whisper`) before the app is imported, and provides fixtures: sample ICS text
 (single + recurring + Meet + Teams + an all-day event to ignore), a temp notes dir,
-and a freeze-time helper. The suite has 240+ tests, including:
+and a freeze-time helper. The suite has 250+ tests, including:
 
 - `test_calendar`: parse single/recurring events, platform & URL detection, window
   filtering, sort order, time zones.
@@ -391,6 +398,9 @@ and a freeze-time helper. The suite has 240+ tests, including:
   clipping, and emit offsets.
 - `test_transcriber`: bounded queue drops oldest, drain on stop, model-load failure is
   raised, and one bad chunk does not kill the worker.
+- `test_model_warmup`: the startup pre-download fetches both missing models into the
+  cache, skips already-cached ones, dedups live==post, and one model's failure neither
+  stops the other nor crashes.
 - `test_config`: round-trip, corrupt-file backup that preserves `ics_url`, and the
   example file matching the code defaults.
 

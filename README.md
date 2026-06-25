@@ -45,7 +45,7 @@ To get names and jargon right, the transcriber is given a short list of words as
 
 ### Windows installer (recommended)
 
-Download the latest Windows installer from the [Releases page](https://github.com/ivantichy/meeting-notetaker/releases), run it, and launch **Meeting Notetaker** from the Start menu. On first run the app asks for your secret calendar URL (see [Configuration](#configuration)) and downloads the Whisper transcription model (this takes a little while; the model is cached in the `models/` folder and reused afterwards).
+Download the latest Windows installer from the [Releases page](https://github.com/ivantichy/meeting-notetaker/releases), run it, and launch **Meeting Notetaker** from the Start menu. On first run the app asks for your secret calendar URL (see [Configuration](#configuration)) and starts fetching the Whisper transcription models in the background (this takes a little while; they are cached in the `models/` folder and reused afterwards, so your first meeting isn't blocked waiting on a download).
 
 ### Run from source
 
@@ -57,7 +57,7 @@ python -m venv .venv
 python -m app.main
 ```
 
-On first run the app asks for your secret calendar URL and downloads the Whisper model. (`run.bat` does the same as the last line if you prefer a double-click.)
+On first run the app asks for your secret calendar URL and fetches the Whisper models in the background. (`run.bat` does the same as the last line if you prefer a double-click.)
 
 ## Configuration
 
@@ -98,7 +98,7 @@ The project ships with a unit-test suite that runs without any audio or Whisper 
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-There are currently **240+ tests** covering calendar parsing, the scheduler, note storage, the recorder state machine, call detection, post-processing, the glossary, and the MCP server. `ARCHITECTURE.md` describes the module layout, contracts, and threading model.
+There are currently **250+ tests** covering calendar parsing, the scheduler, note storage, the recorder state machine, call detection, post-processing, the glossary, and the MCP server. `ARCHITECTURE.md` describes the module layout, contracts, and threading model.
 
 ## MCP server (transcripts as tools)
 
