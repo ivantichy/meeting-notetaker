@@ -1,0 +1,19 @@
+# Normalize line endings. Text files are stored as LF in the repository and
+# checked out natively; this stops the whole tree from showing up as "modified"
+# just because it was checked out with CRLF on Windows.
+* text=auto
+
+# Windows-only scripts must keep CRLF or they break when run.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Known binaries — never touch their bytes.
+*.png  binary
+*.ico  binary
+*.exe  binary
+*.dll  binary
+*.bin  binary
+*.dat  binary
+*.wav  binary
+*.pyd  binary
