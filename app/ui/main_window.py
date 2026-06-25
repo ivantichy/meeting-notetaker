@@ -24,7 +24,7 @@ from app.scheduler import evaluate_calendar_call, gate_start_on_call, pick_actio
 from app.ui.call_panel import CallPanel
 from app.ui.meeting_list import MeetingListWidget
 from app.ui.onboarding import IcsSetupDialog
-from app.ui.theme import STATUS_ERROR, STATUS_PROCESSING
+from app.ui.theme import STATUS_DOWNLOADING, STATUS_ERROR, STATUS_PROCESSING
 
 log = logging.getLogger(__name__)
 
@@ -75,13 +75,24 @@ def _make_tray_icon(color: str) -> QIcon:
 
 class MainWindow(QMainWindow):
     def __init__(
-        self, cfg, calendar_service, recorder, post_processor=None, parent=None
+        self,
+        cfg,
+        calendar_service,
+        recorder,
+        post_processor=None,
+        model_warmup=None,
+        parent=None,
     ) -> None:
         super().__init__(parent)
         self._cfg = cfg
         self._calendar = calendar_service
         self._recorder = recorder
         self._post_processor = post_processor
+        #: Handle na předstažení modelů (W1) — UI z něj čte, jestli se model
+        #: zrovna stahuje, aby nezkoušelo nahrávat „naprázdno" a nespadlo.
+        self._warmup = model_warmup
+        #: Rate-limit logu/statusu „čekám na stažení modelu" (ať tick à 5 s nespamuje).
+        self._last_model_wait_ts: float = 0.0
         self._calendar_worker: _CalendarWorker | None = None
         self._tray_message_shown = False
         self._quitting = False
@@ -162,6 +173,7 @@ class MainWindow(QMainWindow):
         self._icon_idle = _make_tray_icon("#9e9e9e")
         self._icon_recording = _make_tray_icon("#e53935")
         self._icon_postprocessing = _make_tray_icon("#fb8c00")  # oranžová: dopřepis WAV
+        self._icon_downloading = _make_tray_icon(STATUS_DOWNLOADING)  # modrá: stahuji model
         self.setWindowIcon(self._icon_idle)
 
         self._tray = QSystemTrayIcon(self._icon_idle, self)
@@ -299,6 +311,13 @@ class MainWindow(QMainWindow):
                 return
             self._armed_uid = None
             self._meeting_list.set_armed_uid(None)
+            # W1: dokud se model živého přepisu stahuje, NEPOKOUŠET se nahrávat —
+            # jinak CTranslate2 otevře nedostažený model.bin a spadne to. Místo
+            # toho počkáme; plánovač to zkusí znovu za 5 s a jakmile je model
+            # stažený, záznam se rozběhne sám.
+            if not self._live_model_ready():
+                self._defer_for_model(meeting)
+                return
             try:
                 self._recorder.start(meeting)
             except Exception as exc:  # noqa: BLE001
@@ -306,7 +325,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(
                     self,
                     "Chyba záznamu",
-                    f"Nepodařilo se spustit záznam schůzky „{meeting.title}“:\n{exc}",
+                    f"Záznam schůzky „{meeting.title}“ se nepodařilo spustit. "
+                    "Přepisovací model možná ještě není připravený — zkuste to "
+                    f"za chvíli.\n\nDetail: {exc}",
                 )
         elif action == "stop":
             # Kalendářový čas vypršel, ale meeting se může protáhnout:
@@ -393,6 +414,11 @@ class MainWindow(QMainWindow):
             and state == RecorderState.IDLE
             and _time.monotonic() >= self._detector_cooldown_until
         ):
+            # W1: stejné gating jako u kalendářového startu — dokud se model
+            # živého přepisu stahuje, záznam nespouštíme (počkáme na dostažení).
+            if not self._live_model_ready():
+                self._defer_for_model(None)
+                return
             log.info("Detekován hovor (%s) — spouštím záznam.", label)
             try:
                 self._recorder.start_manual(title=label)
@@ -402,6 +428,44 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 log.exception("Start detekovaného záznamu selhal")
                 self._detector_cooldown_until = _time.monotonic() + 120
+
+    def _live_model_ready(self) -> bool:
+        """Je model živého přepisu stažený? Když ne, nezkoušíme nahrávat (W1).
+
+        Defenzivní: při nejistotě (chyba FS) vrací True — raději zkusit nahrát
+        (a případně padnout do lidské hlášky) než nahrávání zablokovat omylem."""
+        try:
+            from app.transcriber import model_is_downloaded
+
+            return model_is_downloaded(self._cfg.live_model, "models")
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _defer_for_model(self, meeting) -> None:
+        """Hovor je tu, ale model živého přepisu se ještě stahuje (W1).
+
+        Nepouštíme záznam (jinak by spadl na „Unable to open model.bin"); jen
+        dáme najevo, že začne automaticky po dostažení. Plánovač to zkusí znovu
+        za 5 s. Log i status bar jsou rate-limitované (tick à 5 s nesmí spamovat).
+        """
+        import time as _t
+
+        if meeting is not None:
+            self._armed_uid = meeting.uid
+            self._meeting_list.set_armed_uid(meeting.uid)
+            self._call_panel.set_next_meeting(meeting, armed=True)
+        now = _t.monotonic()
+        if now - self._last_model_wait_ts > 20.0:
+            self._last_model_wait_ts = now
+            log.info(
+                "Hovor je aktivní, ale model živého přepisu se ještě stahuje — "
+                "odkládám start záznamu (spustí se po dostažení modelu)."
+            )
+        self.statusBar().setStyleSheet(f"color: {STATUS_DOWNLOADING};")
+        self.statusBar().showMessage(
+            "Hovor detekován — čekám na stažení přepisovacího modelu, "
+            "záznam začne automaticky…"
+        )
 
     def _model_download_message(self) -> str:
         """Hláška o jednorázovém stahování Whisper modelu (M9), nebo "".
@@ -419,6 +483,13 @@ class MainWindow(QMainWindow):
         live = getattr(self._recorder, "_transcriber", None)
         if live is not None and getattr(live, "model_status", "") == "downloading":
             return "⏳ Stahuji model živého přepisu… (jednorázově)"
+        # W1: předstažení modelů na pozadí při startu — ještě než vznikne
+        # transcriber/post-processor model. Ukazuje, který model se zrovna táhne.
+        wu = self._warmup
+        if wu is not None:
+            name = wu.downloading
+            if name:
+                return f"⏳ Stahuji model „{name}“… (poprvé; záznam začne po stažení)"
         return ""
 
     def _update_post_status(self) -> None:
@@ -426,12 +497,10 @@ class MainWindow(QMainWindow):
         liště + oranžová tray ikona (pokud zrovna nenahráváme — červená má
         přednost)."""
         pp = self._post_processor
-        if pp is None:
-            return
         downloading = self._model_download_message()
-        busy = pp.busy
+        busy = bool(pp is not None and pp.busy)
         if downloading:
-            # Stahování modelu má přednost před hláškou o dopřepisu (M9).
+            # Stahování modelu má přednost před hláškou o dopřepisu (M9/W1).
             self._post_label.setText(downloading)
         elif busy:
             current = pp.current
@@ -449,15 +518,15 @@ class MainWindow(QMainWindow):
         )
         if recording:
             return  # červenou ikonu řídí _on_state_changed
-        if busy or downloading:
+        if downloading:
+            # Stahování modelu: modrá ikona, odlišená od oranžové „dopřepisuji" (W1).
+            self._tray.setIcon(self._icon_downloading)
+            self.setWindowIcon(self._icon_downloading)
+            self._tray.setToolTip("Meeting Notetaker — stahuji přepisovací model")
+        elif busy:
             self._tray.setIcon(self._icon_postprocessing)
             self.setWindowIcon(self._icon_postprocessing)
-            tip = (
-                "Meeting Notetaker — stahuji model"
-                if downloading
-                else "Meeting Notetaker — dopřepisuji záznam"
-            )
-            self._tray.setToolTip(tip)
+            self._tray.setToolTip("Meeting Notetaker — dopřepisuji záznam")
         else:
             self._tray.setIcon(self._icon_idle)
             self.setWindowIcon(self._icon_idle)
@@ -510,6 +579,10 @@ class MainWindow(QMainWindow):
         if state == RecorderState.RECORDING:
             self._tray.setIcon(self._icon_recording)
             self.setWindowIcon(self._icon_recording)
+            # Model byl mezitím dostažen a záznam se rozběhl — smaž modrou
+            # hlášku „čekám na stažení modelu" z odloženého startu (W1).
+            self.statusBar().setStyleSheet("")
+            self.statusBar().showMessage("Nahrávám…")
         else:
             self._tray.setIcon(self._icon_idle)
             self.setWindowIcon(self._icon_idle)

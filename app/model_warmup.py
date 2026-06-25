@@ -15,21 +15,17 @@ se; když jsou, neděláme nic. Stahujeme jen SOUBORY (``faster_whisper.
 download_model`` — stejná cesta, jakou ``WhisperModel(..., download_root=...)``
 volá interně), model se NEnačítá do RAM, takže start nezdraží paměťově.
 
-Plně defenzivní: jakákoliv chyba (offline, výpadek HF, plný disk) se jen
-zaloguje a NIKDY neshodí appku. Nahrávání má svůj dosavadní lazy fallback, takže
-i kdyby předstažení selhalo, chování zůstává jako dřív (jen s rizikem, že první
-hovor dál čeká na stažení).
+Stav stahování je pozorovatelný (``ModelWarmup.downloading`` / ``finished``),
+aby UI mohlo ukázat indikátor a hlavně aby se plánovač NEPOKOUŠEL spustit
+záznam, dokud živý model není stažený (jinak by to spadlo). Plně defenzivní:
+jakákoliv chyba se jen zaloguje a NIKDY neshodí appku.
 """
 from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING
 
 from app.transcriber import model_is_downloaded
-
-if TYPE_CHECKING:  # pragma: no cover - jen pro typy
-    from app.config import AppConfig
 
 log = logging.getLogger(__name__)
 
@@ -39,55 +35,98 @@ log = logging.getLogger(__name__)
 DOWNLOAD_ROOT = "models"
 
 
-def _ensure_downloaded(model_name: str) -> None:
-    """Idempotentně zajistí stažení jednoho modelu do ``DOWNLOAD_ROOT``.
+class ModelWarmup:
+    """Handle na běžící předstažení modelů + jeho pozorovatelný stav.
 
-    Když už je v cache, nesahá na síť (rychlý lokální test ``model_is_downloaded``).
-    Jinak stáhne jen soubory přes ``faster_whisper.download_model`` se stejným
-    ``cache_dir``, jaký používá ``WhisperModel(..., download_root="models")``
-    interně — tedy bez načtení modelu do paměti.
+    Stav čte UI vlákno (``downloading`` / ``finished``), zapisuje pracovní
+    vlákno — vše pod zámkem, takže čtení napříč vlákny je bezpečné.
     """
-    if not model_name:
-        return
-    if model_is_downloaded(model_name, DOWNLOAD_ROOT):
-        log.info("Model '%s' je už stažený — předstažení přeskočeno.", model_name)
-        return
-    from faster_whisper import download_model  # líný import (v testech mock)
 
-    log.info("Předstahuji model '%s' do '%s/'…", model_name, DOWNLOAD_ROOT)
-    download_model(model_name, cache_dir=DOWNLOAD_ROOT)
-    log.info("Model '%s' předstažen.", model_name)
+    def __init__(self, model_names: "tuple[str, ...]") -> None:
+        self._lock = threading.Lock()
+        self._names = model_names
+        self._downloading: "str | None" = None
+        self._finished = False
+        #: Vyplní ``start_model_warmup`` po spuštění vlákna.
+        self.thread: "threading.Thread | None" = None
+
+    # ------------------------------------------------------- pracovní vlákno
+    def _run(self) -> None:
+        for name in self._names:
+            try:
+                if model_is_downloaded(name, DOWNLOAD_ROOT):
+                    log.info("Model '%s' je už stažený — předstažení přeskočeno.", name)
+                    continue
+                self._set_downloading(name)
+                from faster_whisper import download_model  # líný import (v testech mock)
+
+                log.info("Předstahuji model '%s' do '%s/'…", name, DOWNLOAD_ROOT)
+                download_model(name, cache_dir=DOWNLOAD_ROOT)
+                log.info("Model '%s' předstažen.", name)
+            except Exception:  # noqa: BLE001 — předstažení nesmí nikdy shodit appku
+                log.warning(
+                    "Předstažení modelu '%s' selhalo — nahrávání ho zkusí stáhnout "
+                    "lazy jako dřív.",
+                    name,
+                    exc_info=True,
+                )
+            finally:
+                self._clear_downloading(name)
+        self._mark_finished()
+
+    def _set_downloading(self, name: str) -> None:
+        with self._lock:
+            self._downloading = name
+
+    def _clear_downloading(self, name: str) -> None:
+        with self._lock:
+            if self._downloading == name:
+                self._downloading = None
+
+    def _mark_finished(self) -> None:
+        with self._lock:
+            self._downloading = None
+            self._finished = True
+
+    # --------------------------------------------------------- čtení (UI)
+    @property
+    def downloading(self) -> "str | None":
+        """Název modelu, který se právě stahuje, nebo ``None``."""
+        with self._lock:
+            return self._downloading
+
+    @property
+    def finished(self) -> bool:
+        """True, když předstažení doběhlo (všechny modely vyřízené)."""
+        with self._lock:
+            return self._finished
+
+    # ------------------------------------------------- pohodlí / testy
+    def join(self, timeout: "float | None" = None) -> None:
+        if self.thread is not None:
+            self.thread.join(timeout)
+
+    def is_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
 
 
-def _warmup(model_names: "tuple[str, ...]") -> None:
-    """Projde modely a každý se pokusí stáhnout; chyba jednoho nezastaví druhý."""
-    for name in model_names:
-        try:
-            _ensure_downloaded(name)
-        except Exception:  # noqa: BLE001 — předstažení nesmí nikdy shodit appku
-            log.warning(
-                "Předstažení modelu '%s' selhalo — nahrávání ho zkusí stáhnout "
-                "lazy jako dřív.",
-                name,
-                exc_info=True,
-            )
-
-
-def start_model_warmup(cfg: "AppConfig") -> threading.Thread:
+def start_model_warmup(cfg) -> ModelWarmup:
     """Na pozadí předstáhne ``live_model`` i ``post_model`` z configu (W1).
 
     Neblokuje start UI (daemon vlákno). Zachová pořadí (živý nejdřív — je
     potřeba dřív), ale vynechá prázdné hodnoty i duplicitu (když ``live_model``
-    == ``post_model``, stahuje se jen jednou). Vrací spuštěné vlákno (kvůli
-    testovatelnosti a případnému join při ukončení).
+    == ``post_model``, stahuje se jen jednou). Vrací ``ModelWarmup`` handle, ze
+    kterého UI čte stav.
     """
     names: "tuple[str, ...]" = tuple(
         dict.fromkeys(n for n in (cfg.live_model, cfg.post_model) if n)
     )
+    handle = ModelWarmup(names)
     if names:
         log.info("Spouštím předstažení modelů na pozadí: %s", ", ".join(names))
     thread = threading.Thread(
-        target=_warmup, args=(names,), name="model-warmup", daemon=True
+        target=handle._run, name="model-warmup", daemon=True
     )
+    handle.thread = thread
     thread.start()
-    return thread
+    return handle

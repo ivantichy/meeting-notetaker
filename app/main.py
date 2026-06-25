@@ -124,9 +124,15 @@ def main() -> int:
     # (nahrávání má svůj dosavadní lazy fallback).
     from app.model_warmup import start_model_warmup
 
-    start_model_warmup(cfg)
+    warmup = start_model_warmup(cfg)
 
-    window = MainWindow(cfg, calendar_service, recorder, post_processor=post_processor)
+    window = MainWindow(
+        cfg,
+        calendar_service,
+        recorder,
+        post_processor=post_processor,
+        model_warmup=warmup,
+    )
     # Start na pozadí: aplikace žije v oznamovací oblasti (tray). Okno otevře
     # uživatel dvojklikem na ikonu nebo přes „Zobrazit" v jejím menu.
     from PySide6.QtWidgets import QSystemTrayIcon

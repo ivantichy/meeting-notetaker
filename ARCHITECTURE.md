@@ -316,9 +316,9 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
     "Nahrát teď" ("Record now") button, and a countdown to the auto-start.
   - Status bar: calendar last refresh / error; a "⏳ Dopřepisuji…" ("re-transcribing")
     indicator while the post-processor is busy.
-  - Tray icon: colour reflects state (grey idle / red recording / orange
-    re-transcribing); double-click restores the window; the close button minimizes to
-    the tray; the tray menu has Quit.
+  - Tray icon: colour reflects state (grey idle / blue downloading the model / red
+    recording / orange re-transcribing); double-click restores the window; the close
+    button minimizes to the tray; the tray menu has Quit.
   - First-run dialog: asks for the secret ICS URL and saves the config.
 - `theme.py` applies a shared light/dark theme (it follows the Windows setting and
   uses an indigo accent).
@@ -349,13 +349,16 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
 - Audio device missing or lost mid-call -> capture raises a device error that stops the
   recording and shows a rate-limited message.
 - Whisper model download (first run, ~2 GB from Hugging Face) -> the live and post models
-  are pre-fetched in the background at startup (`model_warmup.py`, a daemon thread), so a
-  fresh install does not start a multi-hundred-MB download at the exact moment the first
-  call begins recording (which would otherwise make CTranslate2 fail to open the
-  still-incomplete `model.bin`). If a model is still missing when needed it is fetched
-  lazily on first use as before, and the status bar shows a "Stahuji model…" indicator
-  while a download is in progress. The live queue is bounded (drops the oldest chunk under
-  back-pressure) and a model-load failure is reported, not swallowed.
+  are pre-fetched in the background at startup (`model_warmup.py`, a daemon thread that
+  exposes an observable status). While the live model is still downloading the UI shows a
+  blue tray icon and a "Stahuji model…" status line, and auto-record is **gated**: the
+  scheduler/detector do not call `recorder.start` until the live model is on disk (they
+  just retry on the next 5 s tick). A fresh install therefore no longer tries to record
+  the first call against a still-downloading `model.bin` and crash — the recording starts
+  automatically once the model is ready. If a recording is somehow forced before a model
+  is available, the failure is shown as a human message (not the raw CTranslate2 error).
+  The live queue is bounded (drops the oldest chunk under back-pressure) and a model-load
+  failure is reported, not swallowed.
 - App restart mid-meeting -> the scheduler sees the in-progress meeting -> start() ->
   NoteStore appends a continuation marker. Unfinished re-transcriptions are picked up
   by the post-processor's orphan scan on the next start.
@@ -399,8 +402,9 @@ and a freeze-time helper. The suite has 250+ tests, including:
 - `test_transcriber`: bounded queue drops oldest, drain on stop, model-load failure is
   raised, and one bad chunk does not kill the worker.
 - `test_model_warmup`: the startup pre-download fetches both missing models into the
-  cache, skips already-cached ones, dedups live==post, and one model's failure neither
-  stops the other nor crashes.
+  cache, skips already-cached ones, dedups live==post, one model's failure neither stops
+  the other nor crashes, and the handle exposes a downloading→finished status (used by the
+  UI to gate recording and show the indicator).
 - `test_config`: round-trip, corrupt-file backup that preserves `ics_url`, and the
   example file matching the code defaults.
 
