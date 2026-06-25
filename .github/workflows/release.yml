@@ -32,14 +32,14 @@ jobs:
       - name: Build onedir bundle (PyInstaller)
         shell: pwsh
         run: |
-          $root = (Resolve-Path .).Path
-          $env:PYTHONPATH = $root
-          Push-Location packaging/windows
-          pyinstaller --noconfirm --clean --paths "$root" `
-            --distpath "$root\dist" --workpath "$root\build" `
-            MeetingNotetaker.spec
-          Pop-Location
-          if (-not (Test-Path "$root\dist\MeetingNotetaker\MeetingNotetaker.exe")) {
+          # Build from the repo root: the spec resolves its own paths via SPECPATH,
+          # so the default distpath (.\dist) lands where the Inno Setup script
+          # expects it. PYTHONPATH makes the `app` package importable during
+          # analysis. No makespec-only flags here (e.g. --paths) — PyInstaller
+          # rejects those when building from a .spec file.
+          $env:PYTHONPATH = (Resolve-Path .).Path
+          pyinstaller --noconfirm --clean packaging\windows\MeetingNotetaker.spec
+          if (-not (Test-Path "dist\MeetingNotetaker\MeetingNotetaker.exe")) {
             throw "PyInstaller build is missing dist\MeetingNotetaker\MeetingNotetaker.exe"
           }
 

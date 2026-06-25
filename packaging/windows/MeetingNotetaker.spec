@@ -33,8 +33,8 @@ _collect('huggingface_hub')
 
 
 a = Analysis(
-    ['app_entry.py'],
-    pathex=['.'],
+    [os.path.join(SPECPATH, 'app_entry.py')],
+    pathex=[SPECPATH, os.path.abspath(os.path.join(SPECPATH, '..', '..'))],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -90,7 +90,7 @@ if _mcp_ok:
 if _mcp_ok:
     a_mcp = Analysis(
         [_mcp_entry],
-        pathex=['.'],
+        pathex=[SPECPATH, os.path.abspath(os.path.join(SPECPATH, '..', '..'))],
         binaries=[],
         datas=[],
         # FastMCP staví na pydantic/anyio/starlette; přibal je i s podmoduly mcp.
