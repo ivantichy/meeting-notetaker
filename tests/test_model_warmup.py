@@ -124,3 +124,33 @@ def test_stav_downloading_pak_finished():
     assert wu.downloading is None
     assert wu.finished
     assert not wu.is_alive()
+
+
+def test_materialize_symlinks_prevadi_na_realne_soubory(tmp_path):
+    """Symlink snapshots/*/model.bin -> blobs/* se převede na reálný soubor.
+
+    Důvod: zabalený CTranslate2 symlink neotevře. Na Windows bez práv nejde
+    symlink vytvořit -> test se přeskočí (CI běží na Linuxu, kde to projde)."""
+    import pytest
+
+    base = tmp_path / "models" / "models--Systran--faster-whisper-small"
+    (base / "blobs").mkdir(parents=True)
+    blob = base / "blobs" / "deadbeef"
+    blob.write_bytes(b"WHISPER-MODEL-BYTES")
+    snap = base / "snapshots" / "rev1"
+    snap.mkdir(parents=True)
+    link = snap / "model.bin"
+    try:
+        os.symlink(os.path.join("..", "..", "blobs", "deadbeef"), link)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinky nelze vytvořit v tomto prostředí: {exc}")
+    assert os.path.islink(link)
+
+    # cwd == tmp_path (conftest _isolate_cwd), takže relativní "models" je tady.
+    converted = model_warmup.materialize_symlinks("models")
+
+    assert converted == 1
+    assert not os.path.islink(link)
+    assert link.read_bytes() == b"WHISPER-MODEL-BYTES"
+    # Idempotence: druhý běh už nic nepřevádí (je to reálný soubor).
+    assert model_warmup.materialize_symlinks("models") == 0

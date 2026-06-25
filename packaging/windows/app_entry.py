@@ -18,6 +18,12 @@ from __future__ import annotations
 import os
 import sys
 
+# Nová stažení Whisper modelů jako REÁLNÉ soubory, ne symlinky — zabalený
+# CTranslate2 symlinkovaný model.bin neotevře. Nastaveno co nejdřív (před
+# importem app.main / huggingface_hub). app.main to nastavuje také, tady je to
+# pro jistotu na úplném začátku frozen běhu.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+
 
 def _app_base_dir() -> str:
     """Directory that should hold config.json / notes / models / logs."""

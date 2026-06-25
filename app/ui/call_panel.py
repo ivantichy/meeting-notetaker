@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.models import Meeting, RecorderState
-from app.ui.theme import STATUS_PROCESSING, STATUS_RECORDING
+from app.ui.theme import STATUS_DOWNLOADING, STATUS_PROCESSING, STATUS_RECORDING
 
 log = logging.getLogger(__name__)
 
@@ -42,10 +42,12 @@ class CallPanel(QWidget):
 
     _stop_finished = Signal(str)  # "" = OK, jinak text chyby
 
-    def __init__(self, cfg, recorder, parent=None) -> None:
+    def __init__(self, cfg, recorder, model_warmup=None, parent=None) -> None:
         super().__init__(parent)
         self._cfg = cfg
         self._recorder = recorder
+        #: Handle na předstažení modelů (W1) — pro gating ručního startu a indikaci.
+        self._warmup = model_warmup
         self._state = RecorderState.IDLE
         self._next_meeting: Meeting | None = None
         self._armed = False
@@ -195,13 +197,56 @@ class CallPanel(QWidget):
         if self._state == RecorderState.RECORDING:
             self.request_stop()
         elif self._state in (RecorderState.IDLE, RecorderState.ARMED):
+            # W1: dokud se model živého přepisu stahuje, ruční záznam nespouštíme
+            # (jinak by spadl na „Unable to open model.bin") — dáme lidskou hlášku.
+            if not self._live_model_ready():
+                self._warn_model_not_ready()
+                return
             try:
                 self._recorder.start_manual()
             except Exception as exc:  # noqa: BLE001
                 log.exception("Ruční start záznamu selhal")
                 QMessageBox.critical(
-                    self, "Chyba záznamu", f"Nepodařilo se spustit záznam:\n{exc}"
+                    self,
+                    "Chyba záznamu",
+                    "Záznam se nepodařilo spustit. Přepisovací model možná ještě "
+                    f"není připravený — zkuste to za chvíli.\n\nDetail: {exc}",
                 )
+
+    def _live_model_ready(self) -> bool:
+        """Je model živého přepisu stažený? Když ne, ruční záznam nespouštíme (W1)."""
+        try:
+            from app.transcriber import model_is_downloaded
+
+            return model_is_downloaded(self._cfg.live_model, "models")
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _downloading_model(self) -> "str | None":
+        """Název modelu, který se právě předstahuje (z warm-up handle), nebo None."""
+        wu = self._warmup
+        if wu is not None:
+            try:
+                return wu.downloading
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    def _warn_model_not_ready(self) -> None:
+        """Informativní (ne chybová) hláška: model se ještě stahuje, zkus později."""
+        name = self._downloading_model()
+        detail = (
+            f"Model „{name}“ se právě stahuje. "
+            if name
+            else "Přepisovací model se ještě stahuje. "
+        )
+        QMessageBox.information(
+            self,
+            "Stahuji model",
+            detail
+            + "Záznam půjde spustit, jakmile bude model stažený — průběh vidíte "
+            "ve stavové liště a podle modré ikony v oznamovací oblasti.",
+        )
 
     def _apply_state(self) -> None:
         recording = self._state == RecorderState.RECORDING
@@ -239,6 +284,16 @@ class CallPanel(QWidget):
     def _update_idle_info(self) -> None:
         if self._state in (RecorderState.RECORDING, RecorderState.FINALIZING):
             return
+        # W1: když se přepisovací model stahuje, dej to výrazně najevo v panelu.
+        dl = self._downloading_model()
+        if dl is not None:
+            self._next_label.setText(
+                f"⏳ Stahuji přepisovací model „{dl}“… Záznam bude dostupný po stažení."
+            )
+            self._next_label.setStyleSheet(f"color: {STATUS_DOWNLOADING};")
+            self._countdown_label.setText("")
+            return
+        self._next_label.setStyleSheet("")
         if self._next_meeting is None:
             self._next_label.setText("Žádná další schůzka v kalendáři.")
             self._countdown_label.setText("")

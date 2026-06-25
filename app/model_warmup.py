@@ -23,6 +23,8 @@ jakákoliv chyba se jen zaloguje a NIKDY neshodí appku.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import threading
 
 from app.transcriber import model_is_downloaded
@@ -33,6 +35,44 @@ log = logging.getLogger(__name__)
 #: Relativní k pracovnímu adresáři appky (main.py dělá chdir do kořene buildu),
 #: takže předstažení míří do TÉŽE složky, ze které pak nahrávání model čte.
 DOWNLOAD_ROOT = "models"
+
+
+def materialize_symlinks(download_root: str = DOWNLOAD_ROOT) -> int:
+    """Nahradí symlinky v HF cache reálnými soubory (kopiemi). Vrací počet převedených.
+
+    PROČ: ve VÝVOJOVÉM běhu (venv) i ve Windows obecně CTranslate2 symlinkovaný
+    ``model.bin`` otevře, ale v ZABALENÉM (PyInstaller) buildu selže s
+    „Unable to open file 'model.bin'" — i když je soubor přítomný a kompletní.
+    huggingface_hub přitom snapshots/*/* odkazuje symlinky do blobs/. Tady je
+    dereferencujeme na reálné soubory, ať je frozen build spolehlivě otevře.
+    (Nová stažení už symlinky netvoří — viz ``HF_HUB_DISABLE_SYMLINKS`` nastavený
+    v app.main.) Idempotentní: co je reálný soubor, přeskočí; běží na pozadí
+    (kopíruje i stovky MB). Plně defenzivní — chyba se zaloguje, appku neshodí.
+    """
+    count = 0
+    try:
+        for root, _dirs, files in os.walk(download_root):
+            for fn in files:
+                p = os.path.join(root, fn)
+                try:
+                    if not os.path.islink(p):
+                        continue
+                    target = os.path.realpath(p)
+                    if not os.path.isfile(target):
+                        log.warning("Symlink modelu '%s' míří na chybějící cíl '%s'.", p, target)
+                        continue
+                    tmp = p + ".__real.tmp"
+                    shutil.copyfile(target, tmp)
+                    os.remove(p)
+                    os.replace(tmp, p)
+                    count += 1
+                except OSError:
+                    log.warning("Materializace symlinku '%s' selhala.", p, exc_info=True)
+    except OSError:
+        log.warning("Procházení '%s' kvůli materializaci selhalo.", download_root, exc_info=True)
+    if count:
+        log.info("Materializováno %d symlinků modelů na reálné soubory (frozen-CT2 fix).", count)
+    return count
 
 
 class ModelWarmup:
@@ -52,6 +92,8 @@ class ModelWarmup:
 
     # ------------------------------------------------------- pracovní vlákno
     def _run(self) -> None:
+        # Nejdřív sjednoť cache na reálné soubory (frozen-CT2 neotevře symlink).
+        materialize_symlinks(DOWNLOAD_ROOT)
         for name in self._names:
             try:
                 if model_is_downloaded(name, DOWNLOAD_ROOT):

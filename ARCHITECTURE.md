@@ -355,10 +355,17 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
   scheduler/detector do not call `recorder.start` until the live model is on disk (they
   just retry on the next 5 s tick). A fresh install therefore no longer tries to record
   the first call against a still-downloading `model.bin` and crash — the recording starts
-  automatically once the model is ready. If a recording is somehow forced before a model
-  is available, the failure is shown as a human message (not the raw CTranslate2 error).
-  The live queue is bounded (drops the oldest chunk under back-pressure) and a model-load
-  failure is reported, not swallowed.
+  automatically once the model is ready (the manual "Nahrát teď" button is gated the same
+  way). If a recording is somehow forced before a model is available, the failure is shown
+  as a human message (not the raw CTranslate2 error). The live queue is bounded (drops the
+  oldest chunk under back-pressure) and a model-load failure is reported, not swallowed.
+- Models are cached as **real files, not symlinks**. The packaged (PyInstaller) build of
+  CTranslate2 fails to open a *symlinked* `model.bin` ("Unable to open file 'model.bin'")
+  even when the file is present and complete — although the dev build (same CTranslate2)
+  and Windows itself open it fine, so the model looks downloaded yet recording crashes. To
+  avoid this, `HF_HUB_DISABLE_SYMLINKS=1` is set before Hugging Face is imported (new
+  downloads become real files) and `model_warmup.materialize_symlinks()` dereferences any
+  pre-existing snapshot symlinks into real copies at startup.
 - App restart mid-meeting -> the scheduler sees the in-progress meeting -> start() ->
   NoteStore appends a continuation marker. Unfinished re-transcriptions are picked up
   by the post-processor's orphan scan on the next start.
@@ -404,7 +411,8 @@ and a freeze-time helper. The suite has 250+ tests, including:
 - `test_model_warmup`: the startup pre-download fetches both missing models into the
   cache, skips already-cached ones, dedups live==post, one model's failure neither stops
   the other nor crashes, and the handle exposes a downloading→finished status (used by the
-  UI to gate recording and show the indicator).
+  UI to gate recording and show the indicator), and `materialize_symlinks` dereferences a
+  snapshot symlink into a real file.
 - `test_config`: round-trip, corrupt-file backup that preserves `ics_url`, and the
   example file matching the code defaults.
 

@@ -7,6 +7,14 @@ import os
 import sys
 from pathlib import Path
 
+# Nová stažení Whisper modelů ukládej jako REÁLNÉ soubory, ne symlinky do blobs/.
+# Zabalený (PyInstaller) build CTranslate2 totiž symlinkovaný model.bin neotevře
+# („Unable to open file 'model.bin'"), i když je soubor přítomný a kompletní.
+# Musí být nastaveno DŘÍV, než se poprvé naimportuje huggingface_hub (děje se
+# líně až při stahování). ``setdefault`` ponechá případné nastavení z prostředí.
+# Existující symlinkované modely srovná ``model_warmup.materialize_symlinks``.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+
 
 def _setup_logging() -> None:
     fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"

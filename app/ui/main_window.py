@@ -117,7 +117,7 @@ class MainWindow(QMainWindow):
 
         # --- rozložení -----------------------------------------------------
         self._meeting_list = MeetingListWidget()
-        self._call_panel = CallPanel(cfg, recorder)
+        self._call_panel = CallPanel(cfg, recorder, model_warmup=model_warmup)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._meeting_list)
