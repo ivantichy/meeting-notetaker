@@ -214,11 +214,13 @@ class CallPanel(QWidget):
                 )
 
     def _live_model_ready(self) -> bool:
-        """Je model živého přepisu stažený? Když ne, ruční záznam nespouštíme (W1)."""
+        """Je model živého přepisu připravený (reálný model.bin)? Když ne, ruční
+        záznam nespouštíme (W1/W2) — ``model_store.is_ready`` kontroluje reálný
+        soubor + kompletní sadu."""
         try:
-            from app.transcriber import model_is_downloaded
+            from app import model_store
 
-            return model_is_downloaded(self._cfg.live_model, "models")
+            return model_store.is_ready(self._cfg.live_model)
         except Exception:  # noqa: BLE001
             return True
 

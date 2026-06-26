@@ -359,13 +359,24 @@ versus the loopback channel: louder microphone -> "Ivan", louder loopback ->
   way). If a recording is somehow forced before a model is available, the failure is shown
   as a human message (not the raw CTranslate2 error). The live queue is bounded (drops the
   oldest chunk under back-pressure) and a model-load failure is reported, not swallowed.
-- Models are cached as **real files, not symlinks**. The packaged (PyInstaller) build of
-  CTranslate2 fails to open a *symlinked* `model.bin` ("Unable to open file 'model.bin'")
-  even when the file is present and complete — although the dev build (same CTranslate2)
-  and Windows itself open it fine, so the model looks downloaded yet recording crashes. To
-  avoid this, `HF_HUB_DISABLE_SYMLINKS=1` is set before Hugging Face is imported (new
-  downloads become real files) and `model_warmup.materialize_symlinks()` dereferences any
-  pre-existing snapshot symlinks into real copies at startup.
+- Model storage is centralized in **`model_store.py`** (W2), the single source of truth for
+  paths, readiness, download and updates. Each model lives in its **own real-file directory**
+  `models/<name>/` (downloaded via `download_model(output_dir=...)`, which writes real files —
+  no Hugging Face `blobs/`/symlink cache), and is loaded **by path** with
+  `WhisperModel(models/<name>)`. Why: the packaged (PyInstaller) build of CTranslate2 cannot
+  open a *symlinked* `model.bin` from the default HF cache ("Unable to open file 'model.bin'")
+  even though the file is present and complete and the dev build + Windows open it fine — so
+  the model looks downloaded yet recording crashes. Real per-model dirs delete that bug class
+  and halve disk (no blob duplication). `is_ready(name)` checks the real `model.bin` (not a
+  symlink, ≥ a size floor) plus the full support-file set, so gating is correct (not just
+  "dir non-empty"). `ensure_model` first migrates an existing legacy HF cache into the new
+  layout transactionally (copy + size-verify + atomic replace, **never deleting** the only
+  copy), else downloads with retry/backoff (flaky network / `WinError 10054`). A single-flight
+  lock prevents concurrent downloads. Downloads happen only when a model is **missing** — there
+  is no per-startup auto-update; a manual tray action "Zkontrolovat aktualizace modelů" fetches
+  a newer version into a temp dir that is applied on next restart (never overwriting a loaded
+  model). A model that ultimately fails to download is surfaced (amber tray icon + status line
+  + one-time tray notification), not silently swallowed.
 - App restart mid-meeting -> the scheduler sees the in-progress meeting -> start() ->
   NoteStore appends a continuation marker. Unfinished re-transcriptions are picked up
   by the post-processor's orphan scan on the next start.
@@ -408,11 +419,13 @@ and a freeze-time helper. The suite has 250+ tests, including:
   clipping, and emit offsets.
 - `test_transcriber`: bounded queue drops oldest, drain on stop, model-load failure is
   raised, and one bad chunk does not kill the worker.
-- `test_model_warmup`: the startup pre-download fetches both missing models into the
-  cache, skips already-cached ones, dedups live==post, one model's failure neither stops
-  the other nor crashes, and the handle exposes a downloading→finished status (used by the
-  UI to gate recording and show the indicator), and `materialize_symlinks` dereferences a
-  snapshot symlink into a real file.
+- `test_model_store`: `is_ready` (full file set + real size, not a symlink), legacy-cache
+  migration without download, download-when-missing, ready-skips-download, pending-update
+  apply (swap), and `check_for_updates` (ready / current / offline) — the core W2 logic.
+- `test_model_warmup`: the startup runner ensures both missing models, skips ready ones,
+  dedups live==post, one model's failure is marked `failed` without stopping the other or
+  crashing, and the handle exposes a downloading→finished status (used by the UI to gate
+  recording and show the indicator/warning).
 - `test_config`: round-trip, corrupt-file backup that preserves `ics_url`, and the
   example file matching the code defaults.
 

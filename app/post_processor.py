@@ -120,15 +120,14 @@ def _build_default_transcribe(cfg, attendees=None):
     schůzky. ``attendees`` je jen fallback prompt, když volající žádný nepředá
     (a kvůli zpětné kompatibilitě se starým podpisem).
     """
-    from faster_whisper import WhisperModel  # líný import — na Linuxu/testech mock
+    from app import model_store  # líný import — na Linuxu/testech mock
 
     from app.glossary import build_initial_prompt
 
-    model = WhisperModel(
+    model = model_store.load_whisper(
         cfg.post_model,
         device="cpu",
         compute_type="int8",
-        download_root="models",
         cpu_threads=max(2, (os.cpu_count() or 8) // 2),
         num_workers=1,
     )

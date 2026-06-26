@@ -24,7 +24,12 @@ from app.scheduler import evaluate_calendar_call, gate_start_on_call, pick_actio
 from app.ui.call_panel import CallPanel
 from app.ui.meeting_list import MeetingListWidget
 from app.ui.onboarding import IcsSetupDialog
-from app.ui.theme import STATUS_DOWNLOADING, STATUS_ERROR, STATUS_PROCESSING
+from app.ui.theme import (
+    STATUS_DOWNLOADING,
+    STATUS_ERROR,
+    STATUS_PROCESSING,
+    STATUS_WARNING,
+)
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +47,7 @@ class _Bridge(QObject):
     state_changed = Signal(str)
     segment = Signal(float, float, str)
     device_error = Signal(str)  # výpadek zvukového zařízení během záznamu (H5)
+    updates_checked = Signal(str)  # výsledek ruční kontroly aktualizací modelů
 
 
 class _CalendarWorker(QThread):
@@ -158,6 +164,9 @@ class MainWindow(QMainWindow):
         self._bridge.device_error.connect(
             self._on_device_error, Qt.ConnectionType.QueuedConnection
         )
+        self._bridge.updates_checked.connect(
+            self._on_updates_checked, Qt.ConnectionType.QueuedConnection
+        )
         recorder.on_state_changed.append(
             lambda s: self._bridge.state_changed.emit(getattr(s, "value", str(s)))
         )
@@ -174,6 +183,9 @@ class MainWindow(QMainWindow):
         self._icon_recording = _make_tray_icon("#e53935")
         self._icon_postprocessing = _make_tray_icon("#fb8c00")  # oranžová: dopřepis WAV
         self._icon_downloading = _make_tray_icon(STATUS_DOWNLOADING)  # modrá: stahuji model
+        self._icon_warning = _make_tray_icon(STATUS_WARNING)  # jantarová: stažení selhalo
+        #: Modely, na jejichž selhání jsme už upozornili bublinou (jednorázově).
+        self._notified_failures: set[str] = set()
         self.setWindowIcon(self._icon_idle)
 
         self._tray = QSystemTrayIcon(self._icon_idle, self)
@@ -185,11 +197,14 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self._open_settings)
         glossary_action = QAction("Otevřít glosář…", self)
         glossary_action.triggered.connect(self._open_glossary)
+        update_action = QAction("Zkontrolovat aktualizace modelů…", self)
+        update_action.triggered.connect(self._check_model_updates)
         quit_action = QAction("Ukončit", self)
         quit_action.triggered.connect(self._quit)
         tray_menu.addAction(show_action)
         tray_menu.addAction(settings_action)
         tray_menu.addAction(glossary_action)
+        tray_menu.addAction(update_action)
         tray_menu.addSeparator()
         tray_menu.addAction(quit_action)
         self._tray.setContextMenu(tray_menu)
@@ -430,14 +445,13 @@ class MainWindow(QMainWindow):
                 self._detector_cooldown_until = _time.monotonic() + 120
 
     def _live_model_ready(self) -> bool:
-        """Je model živého přepisu stažený? Když ne, nezkoušíme nahrávat (W1).
-
-        Defenzivní: při nejistotě (chyba FS) vrací True — raději zkusit nahrát
-        (a případně padnout do lidské hlášky) než nahrávání zablokovat omylem."""
+        """Je model živého přepisu připravený (reálný model.bin)? Když ne,
+        nezkoušíme nahrávat (W1/W2). ``model_store.is_ready`` kontroluje reálný
+        soubor + kompletní sadu, takže to skutečně zabrání pádu CTranslate2."""
         try:
-            from app.transcriber import model_is_downloaded
+            from app import model_store
 
-            return model_is_downloaded(self._cfg.live_model, "models")
+            return model_store.is_ready(self._cfg.live_model)
         except Exception:  # noqa: BLE001
             return True
 
@@ -492,16 +506,66 @@ class MainWindow(QMainWindow):
                 return f"⏳ Stahuji model „{name}“… (poprvé; záznam začne po stažení)"
         return ""
 
+    def _model_warning_message(self) -> str:
+        """Varování, když se nějaký model nepodařilo stáhnout (a pořád chybí)."""
+        wu = self._warmup
+        if wu is None:
+            return ""
+        try:
+            failed = wu.failed
+        except Exception:  # noqa: BLE001
+            return ""
+        pending = []
+        for name in failed:
+            try:
+                from app import model_store
+
+                if not model_store.is_ready(name):
+                    pending.append(name)
+            except Exception:  # noqa: BLE001
+                pending.append(name)
+        if not pending:
+            return ""
+        return (
+            "⚠ Stažení modelu " + ", ".join(pending) + " selhalo (síť?) — zkuste "
+            "„Zkontrolovat aktualizace modelů“ v menu ikony."
+        )
+
+    def _notify_failures_once(self) -> None:
+        """Jednorázová bublina v traye pro nově selhané modely."""
+        wu = self._warmup
+        if wu is None:
+            return
+        try:
+            new = [n for n in wu.failed if n not in self._notified_failures]
+        except Exception:  # noqa: BLE001
+            return
+        if not new:
+            return
+        self._notified_failures.update(new)
+        self._tray.showMessage(
+            "Meeting Notetaker",
+            "Nepodařilo se stáhnout model: " + ", ".join(new) + ". Finální přepis "
+            "zatím nepoběží — zkuste „Zkontrolovat aktualizace modelů“ v menu ikony.",
+            QSystemTrayIcon.MessageIcon.Warning,
+            9000,
+        )
+
     def _update_post_status(self) -> None:
-        """Indikátor dopřepisování WAV + stahování modelu: text ve stavové
-        liště + oranžová tray ikona (pokud zrovna nenahráváme — červená má
-        přednost)."""
+        """Indikátor: stahování modelu (modrá), selhání stažení (jantarová),
+        dopřepis WAV (oranžová) — text ve stavové liště + barva tray ikony
+        (červenou „nahrává se" řídí _on_state_changed)."""
         pp = self._post_processor
         downloading = self._model_download_message()
+        warning = "" if downloading else self._model_warning_message()
         busy = bool(pp is not None and pp.busy)
         if downloading:
-            # Stahování modelu má přednost před hláškou o dopřepisu (M9/W1).
             self._post_label.setText(downloading)
+            self._post_label.setStyleSheet(f"color: {STATUS_DOWNLOADING}; padding-right: 6px;")
+        elif warning:
+            self._post_label.setText(warning)
+            self._post_label.setStyleSheet(f"color: {STATUS_WARNING}; padding-right: 6px;")
+            self._notify_failures_once()
         elif busy:
             current = pp.current
             waiting = pp.pending
@@ -509,6 +573,7 @@ class MainWindow(QMainWindow):
             if waiting:
                 text += f" (+{waiting} ve frontě)"
             self._post_label.setText(text)
+            self._post_label.setStyleSheet(f"color: {STATUS_PROCESSING}; padding-right: 6px;")
         else:
             self._post_label.setText("")
 
@@ -519,10 +584,13 @@ class MainWindow(QMainWindow):
         if recording:
             return  # červenou ikonu řídí _on_state_changed
         if downloading:
-            # Stahování modelu: modrá ikona, odlišená od oranžové „dopřepisuji" (W1).
             self._tray.setIcon(self._icon_downloading)
             self.setWindowIcon(self._icon_downloading)
             self._tray.setToolTip("Meeting Notetaker — stahuji přepisovací model")
+        elif warning:
+            self._tray.setIcon(self._icon_warning)
+            self.setWindowIcon(self._icon_warning)
+            self._tray.setToolTip("Meeting Notetaker — stažení modelu selhalo")
         elif busy:
             self._tray.setIcon(self._icon_postprocessing)
             self.setWindowIcon(self._icon_postprocessing)
@@ -533,6 +601,53 @@ class MainWindow(QMainWindow):
             self._tray.setToolTip(
                 f"Meeting Notetaker — {_STATE_NAMES_CZ[RecorderState.IDLE]}"
             )
+
+    def _check_model_updates(self) -> None:
+        """Ruční kontrola aktualizací modelů (z tray menu). Stáhne na pozadí do
+        temp; nová verze se projeví až po restartu (nesahá na načtený model)."""
+        if getattr(self, "_update_check_running", False):
+            return
+        self._update_check_running = True
+        self._tray.showMessage(
+            "Meeting Notetaker",
+            "Kontroluji aktualizace modelů…",
+            QSystemTrayIcon.MessageIcon.Information,
+            4000,
+        )
+        names = tuple(
+            dict.fromkeys(n for n in (self._cfg.live_model, self._cfg.post_model) if n)
+        )
+
+        def _worker() -> None:
+            from app import model_store
+
+            results = []
+            for name in names:
+                try:
+                    results.append((name, model_store.check_for_updates(name)))
+                except Exception:  # noqa: BLE001
+                    results.append((name, "error"))
+            self._bridge.updates_checked.emit(self._format_update_results(results))
+
+        import threading as _t
+
+        _t.Thread(target=_worker, name="model-update-check", daemon=True).start()
+
+    @staticmethod
+    def _format_update_results(results) -> str:
+        labels = {
+            "ready": "aktualizace stažena (projeví se po restartu)",
+            "current": "aktuální",
+            "offline": "nepodařilo se ověřit (síť)",
+            "error": "chyba",
+        }
+        if not results:
+            return "Žádné modely k ověření."
+        return "\n".join(f"• {n}: {labels.get(s, s)}" for n, s in results)
+
+    def _on_updates_checked(self, message: str) -> None:
+        self._update_check_running = False
+        QMessageBox.information(self, "Aktualizace modelů", message)
 
     def _update_next_meeting_info(self) -> None:
         if self._armed_uid is not None:

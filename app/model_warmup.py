@@ -1,119 +1,60 @@
-"""Předstažení Whisper modelů na pozadí při startu (W1).
+"""Předstažení Whisper modelů na pozadí při startu (W1) — tenký běhový obal.
 
-Problém (proč to existuje): faster-whisper stahuje model až ve chvíli, kdy ho
-poprvé potřebuje — tedy při startu nahrávání PRVNÍHO hovoru. U čerstvé
-instalace (prázdná cache ``models/``) to znamená stáhnout ~0,5 GB (živý
-``small``) nebo ~1,6 GB (finální ``large-v3-turbo``) přesně v okamžiku, kdy má
-začít přepis. CTranslate2 pak otevře ještě nedostažený ``model.bin`` a záznam
-spadne („Unable to open file 'model.bin'"). První hovor po instalaci tak přijde
-vniveč.
+Veškerá logika (cesty, připravenost, migrace staré cache, stahování s retry,
+nasazení stažených aktualizací) žije v ``app.model_store``. Tady jen na pozadí
+(daemon vlákno) projedeme modely z configu a zveřejníme STAV pro UI:
+``downloading`` (který se zrovna stahuje), ``finished`` (hotovo) a ``failed``
+(které se nepodařilo získat — UI to dá najevo).
 
-Řešení: hned po startu appky na pozadí (daemon vlákno) zajistíme, že jsou oba
-modely z configu (``live_model`` i ``post_model``) stažené do TÉŽE cache, kterou
-appka používá při nahrávání (``download_root="models"``). Když chybí, stáhnou
-se; když jsou, neděláme nic. Stahujeme jen SOUBORY (``faster_whisper.
-download_model`` — stejná cesta, jakou ``WhisperModel(..., download_root=...)``
-volá interně), model se NEnačítá do RAM, takže start nezdraží paměťově.
-
-Stav stahování je pozorovatelný (``ModelWarmup.downloading`` / ``finished``),
-aby UI mohlo ukázat indikátor a hlavně aby se plánovač NEPOKOUŠEL spustit
-záznam, dokud živý model není stažený (jinak by to spadlo). Plně defenzivní:
-jakákoliv chyba se jen zaloguje a NIKDY neshodí appku.
+Proč warm-up vůbec: faster-whisper by jinak stahoval model až ve chvíli prvního
+hovoru; u čerstvé instalace by to první call zdrželo/shodilo. Předstažení na
+pozadí to vyřeší dopředu. Plně defenzivní — nikdy neshodí appku.
 """
 from __future__ import annotations
 
 import logging
-import os
-import shutil
 import threading
 
-from app.transcriber import model_is_downloaded
+from app import model_store
 
 log = logging.getLogger(__name__)
 
-#: Stejný kořen cache jako ``download_root`` v transcriber/post_processor.
-#: Relativní k pracovnímu adresáři appky (main.py dělá chdir do kořene buildu),
-#: takže předstažení míří do TÉŽE složky, ze které pak nahrávání model čte.
-DOWNLOAD_ROOT = "models"
-
-
-def materialize_symlinks(download_root: str = DOWNLOAD_ROOT) -> int:
-    """Nahradí symlinky v HF cache reálnými soubory (kopiemi). Vrací počet převedených.
-
-    PROČ: ve VÝVOJOVÉM běhu (venv) i ve Windows obecně CTranslate2 symlinkovaný
-    ``model.bin`` otevře, ale v ZABALENÉM (PyInstaller) buildu selže s
-    „Unable to open file 'model.bin'" — i když je soubor přítomný a kompletní.
-    huggingface_hub přitom snapshots/*/* odkazuje symlinky do blobs/. Tady je
-    dereferencujeme na reálné soubory, ať je frozen build spolehlivě otevře.
-    (Nová stažení už symlinky netvoří — viz ``HF_HUB_DISABLE_SYMLINKS`` nastavený
-    v app.main.) Idempotentní: co je reálný soubor, přeskočí; běží na pozadí
-    (kopíruje i stovky MB). Plně defenzivní — chyba se zaloguje, appku neshodí.
-    """
-    count = 0
-    try:
-        for root, _dirs, files in os.walk(download_root):
-            for fn in files:
-                p = os.path.join(root, fn)
-                try:
-                    if not os.path.islink(p):
-                        continue
-                    target = os.path.realpath(p)
-                    if not os.path.isfile(target):
-                        log.warning("Symlink modelu '%s' míří na chybějící cíl '%s'.", p, target)
-                        continue
-                    tmp = p + ".__real.tmp"
-                    shutil.copyfile(target, tmp)
-                    os.remove(p)
-                    os.replace(tmp, p)
-                    count += 1
-                except OSError:
-                    log.warning("Materializace symlinku '%s' selhala.", p, exc_info=True)
-    except OSError:
-        log.warning("Procházení '%s' kvůli materializaci selhalo.", download_root, exc_info=True)
-    if count:
-        log.info("Materializováno %d symlinků modelů na reálné soubory (frozen-CT2 fix).", count)
-    return count
+#: Kvůli zpětné kompatibilitě (skripty/testy): kořen modelů.
+DOWNLOAD_ROOT = model_store.MODELS_ROOT
 
 
 class ModelWarmup:
-    """Handle na běžící předstažení modelů + jeho pozorovatelný stav.
-
-    Stav čte UI vlákno (``downloading`` / ``finished``), zapisuje pracovní
-    vlákno — vše pod zámkem, takže čtení napříč vlákny je bezpečné.
-    """
+    """Handle na běžící předstažení + jeho pozorovatelný stav (čte UI vlákno)."""
 
     def __init__(self, model_names: "tuple[str, ...]") -> None:
         self._lock = threading.Lock()
         self._names = model_names
         self._downloading: "str | None" = None
         self._finished = False
-        #: Vyplní ``start_model_warmup`` po spuštění vlákna.
+        self._failed: "set[str]" = set()
         self.thread: "threading.Thread | None" = None
 
     # ------------------------------------------------------- pracovní vlákno
     def _run(self) -> None:
-        # Nejdřív sjednoť cache na reálné soubory (frozen-CT2 neotevře symlink).
-        materialize_symlinks(DOWNLOAD_ROOT)
+        # Nejdřív nasaď případné stažené aktualizace (před načtením modelů).
+        try:
+            model_store.apply_pending_updates(self._names)
+        except Exception:  # noqa: BLE001
+            log.warning("Nasazení stažených aktualizací selhalo.", exc_info=True)
         for name in self._names:
             try:
-                if model_is_downloaded(name, DOWNLOAD_ROOT):
-                    log.info("Model '%s' je už stažený — předstažení přeskočeno.", name)
+                if model_store.is_ready(name):
+                    log.info("Model '%s' je k dispozici — předstažení přeskočeno.", name)
                     continue
                 self._set_downloading(name)
-                from faster_whisper import download_model  # líný import (v testech mock)
-
-                log.info("Předstahuji model '%s' do '%s/'…", name, DOWNLOAD_ROOT)
-                download_model(name, cache_dir=DOWNLOAD_ROOT)
-                log.info("Model '%s' předstažen.", name)
-            except Exception:  # noqa: BLE001 — předstažení nesmí nikdy shodit appku
-                log.warning(
-                    "Předstažení modelu '%s' selhalo — nahrávání ho zkusí stáhnout "
-                    "lazy jako dřív.",
-                    name,
-                    exc_info=True,
-                )
+                ok = model_store.ensure_model(name)
+            except Exception:  # noqa: BLE001 — předstažení nesmí shodit appku
+                log.warning("Předstažení modelu '%s' selhalo.", name, exc_info=True)
+                ok = False
             finally:
                 self._clear_downloading(name)
+            if not ok:
+                self._mark_failed(name)
         self._mark_finished()
 
     def _set_downloading(self, name: str) -> None:
@@ -125,6 +66,10 @@ class ModelWarmup:
             if self._downloading == name:
                 self._downloading = None
 
+    def _mark_failed(self, name: str) -> None:
+        with self._lock:
+            self._failed.add(name)
+
     def _mark_finished(self) -> None:
         with self._lock:
             self._downloading = None
@@ -133,7 +78,7 @@ class ModelWarmup:
     # --------------------------------------------------------- čtení (UI)
     @property
     def downloading(self) -> "str | None":
-        """Název modelu, který se právě stahuje, nebo ``None``."""
+        """Název modelu, který se právě stahuje, nebo None."""
         with self._lock:
             return self._downloading
 
@@ -142,6 +87,12 @@ class ModelWarmup:
         """True, když předstažení doběhlo (všechny modely vyřízené)."""
         with self._lock:
             return self._finished
+
+    @property
+    def failed(self) -> "tuple[str, ...]":
+        """Modely, které se nepodařilo získat (UI varuje)."""
+        with self._lock:
+            return tuple(self._failed)
 
     # ------------------------------------------------- pohodlí / testy
     def join(self, timeout: "float | None" = None) -> None:
@@ -153,22 +104,17 @@ class ModelWarmup:
 
 
 def start_model_warmup(cfg) -> ModelWarmup:
-    """Na pozadí předstáhne ``live_model`` i ``post_model`` z configu (W1).
+    """Na pozadí (daemon) předstáhne ``live_model`` i ``post_model`` z configu.
 
-    Neblokuje start UI (daemon vlákno). Zachová pořadí (živý nejdřív — je
-    potřeba dřív), ale vynechá prázdné hodnoty i duplicitu (když ``live_model``
-    == ``post_model``, stahuje se jen jednou). Vrací ``ModelWarmup`` handle, ze
-    kterého UI čte stav.
-    """
+    Neblokuje UI, zachová pořadí (živý nejdřív), vynechá prázdné i duplicitu.
+    Vrací ``ModelWarmup`` handle, ze kterého UI čte stav."""
     names: "tuple[str, ...]" = tuple(
         dict.fromkeys(n for n in (cfg.live_model, cfg.post_model) if n)
     )
     handle = ModelWarmup(names)
     if names:
         log.info("Spouštím předstažení modelů na pozadí: %s", ", ".join(names))
-    thread = threading.Thread(
-        target=handle._run, name="model-warmup", daemon=True
-    )
+    thread = threading.Thread(target=handle._run, name="model-warmup", daemon=True)
     handle.thread = thread
     thread.start()
     return handle

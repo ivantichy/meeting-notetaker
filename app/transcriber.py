@@ -220,21 +220,20 @@ class Transcriber:
                 self._model = self._model_factory()
                 self._set_model_status("ready")
                 return self._model
-            from faster_whisper import WhisperModel  # líný import
+            from app import model_store  # líný import (na Linuxu/testech mock)
 
-            # M9: když model ještě není v models/, nejbližší build spustí
-            # ~GB stahování — ohlásíme to UI předem, ať nevypadá zamrzlé.
-            downloaded = model_is_downloaded(self._cfg.live_model, "models")
-            self._set_model_status("loading" if downloaded else "downloading")
+            # M9: když model ještě není stažený, nejbližší build spustí ~GB
+            # stahování — ohlásíme to UI předem, ať nevypadá zamrzlé.
+            ready = model_store.is_ready(self._cfg.live_model)
+            self._set_model_status("loading" if ready else "downloading")
 
             # Omezíme počet CPU vláken Whisperu, aby zachytávací vlákna
             # (WASAPI) nehladověla a nevznikaly výpadky "data discontinuity".
             cpu_threads = max(2, (os.cpu_count() or 8) // 2)
-            self._model = WhisperModel(
+            self._model = model_store.load_whisper(
                 self._cfg.live_model,
                 device="cpu",
                 compute_type="int8",
-                download_root="models",
                 cpu_threads=cpu_threads,
                 num_workers=1,
             )

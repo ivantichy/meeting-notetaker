@@ -253,10 +253,11 @@ def test_transcriber_reports_downloading_when_model_absent(cfg, monkeypatch):
     """M9: když model ještě není stažený, transcriber projde stavem
     'downloading' a po načtení skončí na 'ready'. faster_whisper je v testech
     mock (conftest), takže reálné stažení neproběhne — řídíme jen detekci."""
-    import app.transcriber as tmod
+    import app.model_store as ms
 
-    # Vynutíme "není stažený" bez závislosti na FS/CWD.
-    monkeypatch.setattr(tmod, "model_is_downloaded", lambda name, root: False)
+    # Vynutíme "není připravený" + fake model bez stahování (bez závislosti na FS).
+    monkeypatch.setattr(ms, "is_ready", lambda name: False)
+    monkeypatch.setattr(ms, "load_whisper", lambda name, **kw: object())
 
     states: list[str] = []
     # Reálná build cesta (model_factory=None) -> WhisperModel z mocku.
@@ -277,9 +278,10 @@ def test_transcriber_reports_downloading_when_model_absent(cfg, monkeypatch):
 
 def test_transcriber_reports_loading_when_model_present(cfg, monkeypatch):
     """Když je model už stažený, hlásí se 'loading' (ne 'downloading')."""
-    import app.transcriber as tmod
+    import app.model_store as ms
 
-    monkeypatch.setattr(tmod, "model_is_downloaded", lambda name, root: True)
+    monkeypatch.setattr(ms, "is_ready", lambda name: True)
+    monkeypatch.setattr(ms, "load_whisper", lambda name, **kw: object())
     states: list[str] = []
     tr = Transcriber(cfg, on_segments=lambda segs: None, model_factory=None)
     tr.on_model_status = states.append

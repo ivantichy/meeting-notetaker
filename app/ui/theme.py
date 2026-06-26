@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QApplication
 STATUS_RECORDING = "#e53935"   # červená: probíhá záznam
 STATUS_PROCESSING = "#fb8c00"  # oranžová: dopřepisování WAV
 STATUS_DOWNLOADING = "#1e88e5"  # modrá: stahuje se přepisovací model (W1)
+STATUS_WARNING = "#f9a825"     # jantarová: stažení modelu selhalo (W1)
 STATUS_ERROR = "#e53935"       # červená: chyba
 
 
