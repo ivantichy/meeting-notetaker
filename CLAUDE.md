@@ -56,7 +56,10 @@ Tenhle soubor je závazný checklist a konvence — drž se ho při KAŽDÉ změ
 
 - **Testuj na platformě, kde bug je.** Některé chování (symlinky, frozen CT2)
   se projeví jen na Windows — nespoléhej, že to pokryje Linux CI.
-- **Nepodepsaný exe** ESET/antivir flagují a resetují mu TLS (problémy se
-  stahováním modelů). Zvážit code-signing exe jako trvalé řešení.
+- **Stahování modelů občas spadne na `WinError 10054`** (reset spojení na
+  huggingface.co). NENÍ to prokazatelně antivir — spadlo to i pod čistým
+  `python.exe`, takže jde o nahodilý síťový/TLS reset. Řeš to retry+backoffem a
+  viditelným hlášením selhání, ne domněnkami o ESETu. (Code-signing exe je
+  obecná hygiena, ne ověřená oprava tohohle.)
 - **Ověřuj na nainstalovaném buildu**, ne jen v dev checkoutu — „funguje v dev"
   neznamená „funguje ve frozen buildu".
