@@ -49,7 +49,11 @@ jobs:
           choco install innosetup -y --no-progress
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
-          & $iscc "packaging\windows\meeting-notetaker.iss"
+          # Verze installeru z gitového tagu (v0.3.1 -> 0.3.1); jinak dev placeholder.
+          $ver = "0.0.0-dev"
+          if ($env:GITHUB_REF_NAME -match '^v(\d.*)$') { $ver = $Matches[1] }
+          Write-Host "Building installer version $ver"
+          & $iscc "/DMyAppVersion=$ver" "packaging\windows\meeting-notetaker.iss"
           $setup = "packaging\windows\Output\MeetingNotetaker-Setup.exe"
           if (-not (Test-Path $setup)) { throw "Installer not produced: $setup" }
 
@@ -66,7 +70,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$env:GITHUB_REF_NAME" `
+          $tag = $env:GITHUB_REF_NAME
+          # Popis releasu = zpráva anotovaného tagu (každý release má popisek).
+          $notes = (git tag -l --format='%(contents)' $tag | Out-String).Trim()
+          if (-not $notes) { $notes = "Meeting Notetaker $tag" }
+          gh release create "$tag" `
             "packaging/windows/Output/MeetingNotetaker-Setup.exe" `
-            --title "$env:GITHUB_REF_NAME" `
-            --generate-notes
+            --title "$tag" `
+            --notes "$notes"

@@ -16,7 +16,11 @@
 #define MyAppName "Meeting Notetaker"
 #define MyAppExeName "MeetingNotetaker.exe"
 #define MyAppPublisher "Meeting Notetaker"
-#define MyAppVersion "1.0.0"
+; Verzi předává release workflow z gitového tagu: ISCC /DMyAppVersion=0.3.1
+; (bez tagu, např. lokální build, zůstane dev placeholder).
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0-dev"
+#endif
 
 [Setup]
 AppId={{8B2A1F3C-7D4E-4A9B-9C1E-7F0A2B3C4D5E}
