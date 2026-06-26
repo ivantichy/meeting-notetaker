@@ -19,6 +19,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # plná historie + anotace tagů (popisek releasu z tag message)
 
       - uses: actions/setup-python@v5
         with:
